@@ -2,6 +2,7 @@
 // Env vars: LASTFM_USERNAME, LASTFM_API_KEY
 // Optional URL params: username, background_color, text_color, accent_color (hex, no #),
 //                      recent=1..8 (how many tracks to list, default 5),
+//                      loved_color (hex, no #), loved=0 (hide the hearts on loved tracks),
 //                      fresh=1 (skip all caching, always the live data)
 // Status: playing -> NOW LISTENING | otherwise -> NOT LISTENING
 // Album art: Last.fm first; if it has none, iTunes and Deezer are tried at the same time.
@@ -51,6 +52,9 @@ const DEFAULT_ACCENT = "#b9cdea";
 const DEFAULT_TEXT = "#f2f6fc";
 const ONLINE_DOT = "#6ee7a0";
 const IDLE_DOT = "#9aa9c0";
+const DEFAULT_LOVED = "#ff6b8b"; // heart on loved (favorite) tracks
+const HEART_PATH = "M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z";
+const HEART_SIZE = 13;
 
 const CACHE_FAST = "public, max-age=0, s-maxage=10, stale-while-revalidate=20";
 const CACHE_LIVE = "no-store, no-cache, max-age=0, must-revalidate";
@@ -160,7 +164,7 @@ async function loadTracks(user, key, n) {
   ]);
 
   const api =
-    `https://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&limit=${n}&format=json` +
+    `https://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&limit=${n}&format=json&extended=1` +
     `&user=${encodeURIComponent(user)}&api_key=${encodeURIComponent(key)}`;
   const data = await (await get(api, LASTFM_TIMEOUT_MS)).json();
 
@@ -182,6 +186,7 @@ async function loadTracks(user, key, n) {
       title: t.name || "Unknown",
       artist: artistOf(t),
       playing: !!(t["@attr"] && t["@attr"].nowplaying === "true"),
+      loved: t.loved === "1" || t.loved === 1,
       uts: t.date && t.date.uts ? Number(t.date.uts) : 0,
       artUrl: pick ? pick["#text"] : "",
       art: null,
@@ -239,6 +244,10 @@ const avatarSvg = (uri, cx, cy) => {
   return inner + `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#ffffff" stroke-opacity="0.35"/>`;
 };
 
+// Small heart for a loved track. x = left edge, y = top edge.
+const heart = (x, y, color) =>
+  `<path d="${HEART_PATH}" fill="${color}" transform="translate(${x.toFixed(1)} ${y}) scale(${(HEART_SIZE / 24).toFixed(4)})"/>`;
+
 // Animated equalizer for the row that is playing right now. cy = vertical center.
 const bars = (cy) =>
   [0, 1, 2, 3]
@@ -263,6 +272,8 @@ module.exports = async (req, res) => {
   const bgFill = q.background_color ? bg : "url(#g)";
   const accent = norm(hex(q.accent_color || q.bar_color, DEFAULT_ACCENT));
   const text = norm(hex(q.text_color, DEFAULT_TEXT));
+  const showLoved = q.loved !== "0";
+  const loved = norm(hex(q.loved_color, DEFAULT_LOVED));
 
   const asked = q.recent === undefined ? DEFAULT_RECENT : parseInt(q.recent, 10);
   const n = Math.min(MAX_RECENT, Math.max(1, Number.isNaN(asked) ? DEFAULT_RECENT : asked));
@@ -348,11 +359,15 @@ module.exports = async (req, res) => {
       if (i > 0) {
         rows += `<line x1="${PAD}" y1="${y0}" x2="${W - PAD}" y2="${y0}" stroke="#ffffff" stroke-opacity="0.1"/>`;
       }
+      const ts = tr.playing ? "" : ago(tr.uts);
+      const rightEdge = tr.playing ? W - PAD - 26 : W - PAD - ts.length * 5.6;
+      const loveMark = showLoved && tr.loved ? heart(rightEdge - 8 - HEART_SIZE, y0 + 17, loved) : "";
       rows +=
         thumb +
         label("t", PAD + THUMB + 14, y0 + 23, 14, i === 0 ? 700 : 600, esc(clip(tr.title, 36))) +
         label("s", PAD + THUMB + 14, y0 + 40, 12, 400, esc(clip(tr.artist, 42))) +
-        (tr.playing ? bars(cy) : label("s", W - PAD, y0 + 27, 11, 400, esc(ago(tr.uts)), ' text-anchor="end"'));
+        loveMark +
+        (tr.playing ? bars(cy) : label("s", W - PAD, y0 + 27, 11, 400, esc(ts), ' text-anchor="end"'));
     });
   }
 
