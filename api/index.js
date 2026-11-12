@@ -68,9 +68,12 @@ async function findArt(lastfmUrl, artist, title) {
 module.exports = async (req, res) => {
   const user = req.query.username || process.env.LASTFM_USERNAME;
   const key = process.env.LASTFM_API_KEY;
-  const bg = hex(req.query.background_color, "#121212");
-  const fg = hex(req.query.text_color, "#ffffff");
-  const bar = hex(req.query.bar_color, "#b3b3b3");
+  // Soft pastel coral-rose accent. It contrasts gently with AniList's blue/purple page.
+  const accent = hex(req.query.accent_color || req.query.bar_color, "#f0a4a8");
+  // No background by default: the card is see-through and blends into whatever page it sits on.
+  const bg = req.query.background_color ? hex(req.query.background_color, null) : null;
+  const fg = hex(req.query.text_color, "#f4eef0");
+  const bar = accent;
 
   let title = "Nothing yet";
   let artist = "";
@@ -101,6 +104,10 @@ module.exports = async (req, res) => {
     title = "Couldn't reach Last.fm";
   }
 
+  const panel = bg
+    ? `<rect width="300" height="100" rx="12" fill="${bg}"/>`
+    : `<rect x="0.5" y="0.5" width="299" height="99" rx="12" fill="${accent}" fill-opacity="0.07" stroke="${accent}" stroke-opacity="0.28"/>`;
+
   const status = playing ? "NOW PLAYING" : "LAST PLAYED";
   const artEl = art
     ? `<image href="${art}" x="10" y="10" width="80" height="80" preserveAspectRatio="xMidYMid slice"/>`
@@ -120,7 +127,7 @@ module.exports = async (req, res) => {
     : "";
 
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="300" height="100" viewBox="0 0 300 100">
-  <rect width="300" height="100" rx="12" fill="${bg}"/>
+  ${panel}
   <clipPath id="c"><rect x="10" y="10" width="80" height="80" rx="6"/></clipPath>
   <g clip-path="url(#c)">${artEl}</g>
   <text x="104" y="32" font-family="Arial, sans-serif" font-size="10" font-weight="700" letter-spacing="1" fill="${bar}">${status}</text>
