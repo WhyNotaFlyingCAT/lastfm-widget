@@ -5,12 +5,15 @@
 //                      fresh=1 (skip all caching, always the live data)
 // Status: playing -> NOW LISTENING | otherwise -> NOT LISTENING
 // Album art: Last.fm first; if it has none, iTunes and Deezer are tried at the same time.
+// Header: light-blue Last.fm logo on the left, profile picture + username on the right.
 
-const PLACEHOLDER_ID = "2a96cbd8b46e442fc41c2b86b821562f"; // Last.fm's default grey star
+const PLACEHOLDER_ID = "2a96cbd8b46e442fc41c2b86b821562f"; // Last.fm's default grey star (album art)
+const AVATAR_PLACEHOLDER_ID = "818148bf682d429dc215c1705eb27b98"; // Last.fm's default profile picture
 const LASTFM_TIMEOUT_MS = 4000;
 const ART_TIMEOUT_MS = 2000;
 const ART_TOTAL_MS = 2500; // hard cap on all art lookups together, so the card never stalls
 const MEMO_MS = 5000;
+const AVATAR_TTL_MS = 60 * 60 * 1000; // profile pictures rarely change, so keep them for an hour
 const DEFAULT_RECENT = 5;
 const MAX_RECENT = 8;
 
@@ -20,6 +23,26 @@ const HEADER_H = 50;
 const ROW_H = 52;
 const PAD = 18;
 const THUMB = 38;
+
+// Header pieces
+// Official Last.fm wordmark (paths from the Last.fm logo SVG, viewBox 708.767 x 179.332).
+// Drawn in the accent color (light blue by default).
+const LOGO_VB_W = 708.767;
+const LOGO_VB_H = 179.332;
+const LOGO_H = 22; // logo height on the card
+const LOGO_SCALE = LOGO_H / LOGO_VB_H;
+const LOGO_W = Math.round(LOGO_VB_W * LOGO_SCALE); // so the status text can start right after it
+const LOGO_PATHS = [
+  "M158.431,165.498l-8.354-22.708c0,0-13.575,15.14-33.932,15.14c-18.013,0-30.802-15.662-30.802-40.721 c0-32.106,16.182-43.591,32.107-43.591c22.969,0,30.277,14.878,36.543,33.934l8.354,26.103 c8.351,25.318,24.013,45.678,69.17,45.678c32.37,0,54.295-9.918,54.295-36.02c0-21.143-12.009-32.107-34.458-37.328l-16.705-3.654 c-11.484-2.61-14.877-7.309-14.877-15.14c0-8.875,7.046-14.096,18.533-14.096c12.529,0,19.315,4.699,20.36,15.923l26.102-3.133 c-2.088-23.492-18.271-33.15-44.896-33.15c-23.491,0-46.462,8.875-46.462,37.327c0,17.75,8.614,28.975,30.277,34.195l17.752,4.175 c13.312,3.133,17.748,8.614,17.748,16.185c0,9.656-9.396,13.572-27.146,13.572c-26.364,0-37.325-13.834-43.591-32.89l-8.614-26.101 c-10.961-33.934-28.452-46.463-63.169-46.463c-38.37,0-58.731,24.275-58.731,65.517c0,39.677,20.361,61.08,56.906,61.08 C144.333,179.332,158.431,165.498,158.431,165.498L158.431,165.498z",
+  "M46.726,153.229c-2.61,0.784-5.221,1.306-8.614,1.306c-6.265,0-10.703-2.87-10.703-10.442V1.827H0v148.792 c0,19.577,13.575,27.672,29.497,27.672c5.221,0,10.181-0.785,16.446-2.349L46.726,153.229L46.726,153.229z",
+  "M376.911,149.053c-6.787,4.701-12.529,7.051-20.36,7.051c-9.92,0-15.401-5.221-15.401-18.012V77.006h36.023V55.603H341.41 V26.625l-27.669,3.394v25.583h-17.49v21.403h17.49v66.826c0,24.02,13.834,35.5,36.284,35.5c12.269,0,23.232-2.346,31.847-7.305 L376.911,149.053L376.911,149.053z",
+  "M400.718,158.449c0,10.705,8.354,19.318,19.056,19.318c11.226,0,19.578-8.613,19.578-19.318 c0-10.963-8.353-19.313-19.578-19.313C409.072,139.136,400.718,147.486,400.718,158.449L400.718,158.449z",
+  "M467.727,77.006v99.195h27.409V77.006h30.803V55.603h-30.803V44.638c0-16.444,7.049-21.665,18.534-21.665 c8.092,0,13.574,1.825,19.839,5.221l4.437-22.974C530.638,1.827,522.023,0,511.582,0c-22.973,0-43.855,10.963-43.855,43.593v12.01 h-17.489v21.403H467.727L467.727,77.006z",
+  "M635.154,79.358c-3.133-19.578-15.923-26.629-32.63-26.629c-16.706,0-31.062,7.571-37.329,26.104l-3.393-23.23h-22.188 v120.598h27.409v-68.129c0-23.235,12.008-32.11,24.799-32.11c13.312,0,18.795,8.875,18.795,23.232v77.006h27.147v-68.39 c0-22.974,12.269-31.849,25.061-31.849c13.052,0,18.532,8.875,18.532,23.232v77.006h27.409V89.539 c0-25.843-15.14-36.81-35.24-36.81C656.561,52.729,641.419,60.3,635.154,79.358L635.154,79.358z",
+];
+const AV = 22; // profile picture diameter
+const AV_GAP = 9; // space between profile picture and username
+const NAME_CHAR_W = 7.4; // rough width of one username character at 13px
 
 const DEFAULT_BG = "#3d5c8c";
 const GRAD_FROM = "#4a74b0";
@@ -35,6 +58,7 @@ const CACHE_LIVE = "no-store, no-cache, max-age=0, must-revalidate";
 const lastGood = new Map(); // user -> last good result, shown if Last.fm hiccups
 
 const artCache = new Map(); // "artist|title" -> data URI
+const avatarCache = new Map(); // user -> { ts, uri }
 const memo = new Map(); // "user|n" -> { ts, data }
 const inflight = new Map(); // "user|n" -> Promise
 
@@ -106,10 +130,35 @@ async function findArt(lastfmUrl, artist, title) {
   return art;
 }
 
+// The user's Last.fm profile picture as a data URI (null if they have none).
+async function getAvatar(user, key) {
+  const hit = avatarCache.get(user);
+  if (hit && Date.now() - hit.ts < AVATAR_TTL_MS) return hit.uri;
+
+  const api =
+    `https://ws.audioscrobbler.com/2.0/?method=user.getinfo&format=json` +
+    `&user=${encodeURIComponent(user)}&api_key=${encodeURIComponent(key)}`;
+  const data = await (await get(api, ART_TIMEOUT_MS)).json();
+  const imgs = data && data.user && Array.isArray(data.user.image) ? data.user.image : [];
+  const pick = imgs.find((i) => i.size === "medium") || imgs.find((i) => i.size === "large") || imgs[imgs.length - 1];
+  const url = pick ? pick["#text"] : "";
+
+  let uri = null;
+  if (url && !url.includes(AVATAR_PLACEHOLDER_ID)) uri = await toDataUri(url);
+  capped(avatarCache, user, { ts: Date.now(), uri }, 20);
+  return uri;
+}
+
 const artistOf = (t) => (t.artist && (t.artist["#text"] || t.artist.name)) || "";
 
-// One trip to Last.fm. Returns { ok, message?, tracks: [{ title, artist, uts, playing, art }] }.
+// One trip to Last.fm. Returns { ok, message?, avatar, tracks: [{ title, artist, uts, playing, art }] }.
 async function loadTracks(user, key, n) {
+  // Start the profile picture lookup right away so it runs alongside everything else.
+  const avatarP = Promise.race([
+    getAvatar(user, key).catch(() => (avatarCache.get(user) || {}).uri || null),
+    new Promise((done) => setTimeout(() => done(null), ART_TOTAL_MS)),
+  ]);
+
   const api =
     `https://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&limit=${n}&format=json` +
     `&user=${encodeURIComponent(user)}&api_key=${encodeURIComponent(key)}`;
@@ -121,7 +170,9 @@ async function loadTracks(user, key, n) {
 
   let list = data && data.recenttracks && data.recenttracks.track;
   if (list && !Array.isArray(list)) list = [list];
-  if (!list || !list.length) return { ok: true, message: "Nothing yet", detail: "No tracks scrobbled", tracks: [] };
+  if (!list || !list.length) {
+    return { ok: true, message: "Nothing yet", detail: "No tracks scrobbled", tracks: [], avatar: await avatarP };
+  }
 
   list = list.slice(0, n);
   const tracks = list.map((t) => {
@@ -137,17 +188,20 @@ async function loadTracks(user, key, n) {
     };
   });
 
-  // All art lookups run in parallel under one overall time cap.
-  await Promise.all(
-    tracks.map((tr) =>
-      Promise.race([
-        findArt(tr.artUrl, tr.artist, tr.title).then((a) => (tr.art = a)).catch(() => null),
-        new Promise((done) => setTimeout(done, ART_TOTAL_MS)),
-      ])
-    )
-  );
+  // All art lookups (and the avatar) run in parallel under one overall time cap.
+  const [, avatar] = await Promise.all([
+    Promise.all(
+      tracks.map((tr) =>
+        Promise.race([
+          findArt(tr.artUrl, tr.artist, tr.title).then((a) => (tr.art = a)).catch(() => null),
+          new Promise((done) => setTimeout(done, ART_TOTAL_MS)),
+        ])
+      )
+    ),
+    avatarP,
+  ]);
   tracks.forEach((tr) => delete tr.artUrl);
-  return { ok: true, tracks };
+  return { ok: true, tracks, avatar };
 }
 
 function getTracks(user, key, n, fresh) {
@@ -165,6 +219,25 @@ function getTracks(user, key, n, fresh) {
   capped(inflight, k, p, 20);
   return p;
 }
+
+// The Last.fm logo. x = left edge, cy = vertical center.
+const logo = (x, cy, color) =>
+  `<g transform="translate(${x} ${cy - LOGO_H / 2}) scale(${LOGO_SCALE.toFixed(5)})" fill="${color}">` +
+  LOGO_PATHS.map((d) => `<path d="${d}"/>`).join("") +
+  `</g>`;
+
+// Profile picture (round) or a simple silhouette if the user has none. cx/cy = center.
+const avatarSvg = (uri, cx, cy) => {
+  const r = AV / 2;
+  const inner = uri
+    ? `<image href="${uri}" x="${cx - r}" y="${cy - r}" width="${AV}" height="${AV}" preserveAspectRatio="xMidYMid slice" clip-path="url(#av)"/>`
+    : `<g clip-path="url(#av)">` +
+      `<circle cx="${cx}" cy="${cy}" r="${r}" fill="#ffffff" fill-opacity="0.2"/>` +
+      `<circle cx="${cx}" cy="${cy - 3}" r="3.6" fill="#ffffff" fill-opacity="0.65"/>` +
+      `<path d="M${cx - 7.5},${cy + r} a7.5,7.5 0 0 1 15,0z" fill="#ffffff" fill-opacity="0.65"/>` +
+      `</g>`;
+  return inner + `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#ffffff" stroke-opacity="0.35"/>`;
+};
 
 // Animated equalizer for the row that is playing right now. cy = vertical center.
 const bars = (cy) =>
@@ -233,30 +306,39 @@ module.exports = async (req, res) => {
   const label = (cls, x, y, size, weight, body, extra = "") =>
     `<text class="${cls}" x="${x}" y="${y}" ${F} font-size="${size}" font-weight="${weight}"${extra}>${body}</text>`;
 
-  // Header: wordmark + status on the left, username on the right.
+  const defs = [];
+
+  // Header: logo + status on the left, profile picture + username on the right.
+  const name = clip(user || "unknown", 24);
+  const avCx = W - PAD - name.length * NAME_CHAR_W - AV_GAP - AV / 2;
+  const avCy = 26;
+  defs.push(`<clipPath id="av"><circle cx="${avCx}" cy="${avCy}" r="${AV / 2}"/></clipPath>`);
+
+  const SX = PAD + LOGO_W + 13; // where the status starts, just after the logo
+
   let out =
-    label("a", PAD, 31, 17, 800, "last.fm", ' letter-spacing="-0.3"') +
+    logo(PAD, 26, accent) +
     (status
-      ? `<circle cx="${PAD + 80}" cy="26.5" r="3.5" fill="${dot}"/>` +
-        label("s", PAD + 90, 31, 11, 700, status, ' letter-spacing="1.1"')
-      : label("s", PAD + 80, 31, 12, 400, "Recently Played")) +
-    label("t", W - PAD, 31, 13, 600, esc(clip(user || "unknown", 24)), ' text-anchor="end"');
+      ? `<circle cx="${SX}" cy="26.5" r="3.5" fill="${dot}"/>` +
+        label("s", SX + 10, 31, 11, 700, status, ' letter-spacing="1.1"')
+      : label("s", SX - 3, 31, 12, 400, "Recently Played")) +
+    avatarSvg(data.avatar, avCx, avCy) +
+    label("t", W - PAD, 31, 13, 600, esc(name), ' text-anchor="end"');
 
   out += `<line x1="${PAD}" y1="${HEADER_H}" x2="${W - PAD}" y2="${HEADER_H}" stroke="#ffffff" stroke-opacity="0.18"/>`;
 
-  const defs = [];
   let rows = "";
 
   if (!tracks.length) {
     // Error / empty state: one message row
-    const y = HEADER_H + 8;
+    const y = HEADER_H;
     rows +=
       `<rect x="${PAD}" y="${y + 7}" width="${THUMB}" height="${THUMB}" rx="6" fill="#ffffff" fill-opacity="0.2"/>` +
       label("t", PAD + THUMB + 14, y + 25, 14, 700, esc(clip(data.message || "Nothing yet", 40))) +
       label("s", PAD + THUMB + 14, y + 42, 12, 400, esc(clip(data.detail || "", 48)));
   } else {
     tracks.forEach((tr, i) => {
-      const y0 = HEADER_H + 8 + i * ROW_H;
+      const y0 = HEADER_H + i * ROW_H; // every row is the same height, thumbnail centered in it
       const cy = y0 + ROW_H / 2 - 4;
       const ty = y0 + 7;
       defs.push(`<clipPath id="c${i}"><rect x="${PAD}" y="${ty}" width="${THUMB}" height="${THUMB}" rx="6"/></clipPath>`);
@@ -264,7 +346,7 @@ module.exports = async (req, res) => {
         ? `<g clip-path="url(#c${i})"><image href="${tr.art}" x="${PAD}" y="${ty}" width="${THUMB}" height="${THUMB}" preserveAspectRatio="xMidYMid slice"/></g>`
         : `<rect x="${PAD}" y="${ty}" width="${THUMB}" height="${THUMB}" rx="6" fill="#ffffff" fill-opacity="0.2"/>`;
       if (i > 0) {
-        rows += `<line x1="${PAD}" y1="${y0 - 4}" x2="${W - PAD}" y2="${y0 - 4}" stroke="#ffffff" stroke-opacity="0.1"/>`;
+        rows += `<line x1="${PAD}" y1="${y0}" x2="${W - PAD}" y2="${y0}" stroke="#ffffff" stroke-opacity="0.1"/>`;
       }
       rows +=
         thumb +
@@ -275,7 +357,7 @@ module.exports = async (req, res) => {
   }
 
   const count = Math.max(1, tracks.length);
-  const height = HEADER_H + 8 + count * ROW_H + 6;
+  const height = HEADER_H + count * ROW_H + 2;
 
   const svg =
     `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${height}" viewBox="0 0 ${W} ${height}" text-rendering="geometricPrecision">` +
