@@ -1,31 +1,42 @@
-// Last.fm "now playing" SVG card for Vercel. Soft blue card, tuned for speed.
+// Last.fm "recently played" SVG card for Vercel. Wide soft-blue card with your username.
 // Env vars: LASTFM_USERNAME, LASTFM_API_KEY
 // Optional URL params: username, background_color, text_color, accent_color (hex, no #),
-//                      fresh=1 (skip all caching, always the live track)
+//                      recent=1..8 (how many tracks to list, default 5),
+//                      fresh=1 (skip all caching, always the live data)
+// Status: playing -> NOW LISTENING | otherwise -> NOT LISTENING
 // Album art: Last.fm first; if it has none, iTunes and Deezer are tried at the same time.
 
 const PLACEHOLDER_ID = "2a96cbd8b46e442fc41c2b86b821562f"; // Last.fm's default grey star
 const LASTFM_TIMEOUT_MS = 4000;
 const ART_TIMEOUT_MS = 2000;
 const ART_TOTAL_MS = 2500; // hard cap on all art lookups together, so the card never stalls
-const MEMO_MS = 5000; // reuse the same Last.fm answer for a few seconds (bursts of views)
+const MEMO_MS = 5000;
+const DEFAULT_RECENT = 5;
+const MAX_RECENT = 8;
+
+// Layout
+const W = 480;
+const HEADER_H = 50;
+const ROW_H = 52;
+const PAD = 18;
+const THUMB = 38;
 
 const DEFAULT_BG = "#3d5c8c";
-const GRAD_FROM = "#4a74b0"; // gradient: lighter blue (top-left)
-const GRAD_TO = "#2f4c7a"; // gradient: deeper blue (bottom-right)
+const GRAD_FROM = "#4a74b0";
+const GRAD_TO = "#2f4c7a";
 const DEFAULT_ACCENT = "#b9cdea";
 const DEFAULT_TEXT = "#f2f6fc";
+const ONLINE_DOT = "#6ee7a0";
+const IDLE_DOT = "#9aa9c0";
 
-// Normal mode: Vercel's edge serves the card instantly and refreshes it in the background.
-// The browser still asks the edge every time (max-age=0), so a new song shows up within ~10-30s.
 const CACHE_FAST = "public, max-age=0, s-maxage=10, stale-while-revalidate=20";
 const CACHE_LIVE = "no-store, no-cache, max-age=0, must-revalidate";
 
-const lastGood = new Map(); // user -> last good track, shown if Last.fm hiccups
+const lastGood = new Map(); // user -> last good result, shown if Last.fm hiccups
 
 const artCache = new Map(); // "artist|title" -> data URI
-const memo = new Map(); // user -> { ts, track }
-const inflight = new Map(); // user -> Promise (so simultaneous views share one request)
+const memo = new Map(); // "user|n" -> { ts, data }
+const inflight = new Map(); // "user|n" -> Promise
 
 const capped = (map, k, v, max) => {
   if (map.size >= max) map.delete(map.keys().next().value);
@@ -37,6 +48,16 @@ const esc = (s) => String(s).replace(/[<>&"']/g, (c) => ESC[c]);
 const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 const hex = (v, fallback) => (/^([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(v || "") ? "#" + v : fallback);
 const norm = (h) => (!h ? null : h.length === 4 ? "#" + [...h.slice(1)].map((c) => c + c).join("") : h.slice(0, 7));
+
+const ago = (uts) => {
+  if (!uts) return "";
+  const s = Math.max(0, Date.now() / 1000 - uts);
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  if (s < 86400 * 30) return Math.floor(s / 86400) + "d ago";
+  return Math.floor(s / (86400 * 30)) + "mo ago";
+};
 
 const get = (url, ms) => fetch(url, { signal: AbortSignal.timeout(ms) });
 
@@ -55,7 +76,7 @@ async function itunesArt(artist, title) {
   const j = await r.json();
   const u = j.results && j.results[0] && j.results[0].artworkUrl100;
   if (!u) throw new Error("no itunes art");
-  return toDataUri(u.replace("100x100", "200x200"));
+  return toDataUri(u);
 }
 
 async function deezerArt(artist, title) {
@@ -63,7 +84,7 @@ async function deezerArt(artist, title) {
   const r = await get(`https://api.deezer.com/search?q=${q}&limit=1`, ART_TIMEOUT_MS);
   const j = await r.json();
   const a = j.data && j.data[0] && j.data[0].album;
-  const u = a && (a.cover_medium || a.cover);
+  const u = a && (a.cover_small || a.cover_medium || a.cover);
   if (!u) throw new Error("no deezer art");
   return toDataUri(u);
 }
@@ -79,68 +100,86 @@ async function findArt(lastfmUrl, artist, title) {
     } catch {}
   }
   if (!art && (artist || title)) {
-    // Both fallbacks run at the same time; the first one with art wins.
     art = await Promise.any([itunesArt(artist, title), deezerArt(artist, title)]).catch(() => null);
   }
-  if (art) capped(artCache, key, art, 40); // failures are retried next time
+  if (art) capped(artCache, key, art, 60);
   return art;
 }
 
-// One trip to Last.fm. Returns { ok, title, artist, playing, art }.
-async function loadTrack(user, key) {
+const artistOf = (t) => (t.artist && (t.artist["#text"] || t.artist.name)) || "";
+
+// One trip to Last.fm. Returns { ok, message?, tracks: [{ title, artist, uts, playing, art }] }.
+async function loadTracks(user, key, n) {
   const api =
-    "https://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&limit=1&format=json" +
+    `https://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&limit=${n}&format=json` +
     `&user=${encodeURIComponent(user)}&api_key=${encodeURIComponent(key)}`;
   const data = await (await get(api, LASTFM_TIMEOUT_MS)).json();
 
   if (data && data.error) {
-    return { ok: false, title: "Last.fm error " + data.error, artist: String(data.message || ""), playing: false, art: null, isTrack: false };
+    return { ok: false, message: "Last.fm error " + data.error, detail: String(data.message || ""), tracks: [] };
   }
 
-  let t = data && data.recenttracks && data.recenttracks.track;
-  if (Array.isArray(t)) t = t[0];
-  if (!t) return { ok: true, title: "Nothing yet", artist: "", playing: false, art: null, isTrack: false };
+  let list = data && data.recenttracks && data.recenttracks.track;
+  if (list && !Array.isArray(list)) list = [list];
+  if (!list || !list.length) return { ok: true, message: "Nothing yet", detail: "No tracks scrobbled", tracks: [] };
 
-  const title = t.name || "Nothing yet";
-  const artist = (t.artist && (t.artist["#text"] || t.artist.name)) || "";
-  const playing = !!(t["@attr"] && t["@attr"].nowplaying === "true");
-  const imgs = Array.isArray(t.image) ? t.image : [];
-  const pick = imgs.find((i) => i.size === "large") || imgs[imgs.length - 1];
-  const art = await Promise.race([
-    findArt(pick ? pick["#text"] : "", artist, title),
-    new Promise((done) => setTimeout(() => done(null), ART_TOTAL_MS)),
-  ]);
-  return { ok: true, title, artist, playing, art, isTrack: true };
+  list = list.slice(0, n);
+  const tracks = list.map((t) => {
+    const imgs = Array.isArray(t.image) ? t.image : [];
+    const pick = imgs.find((i) => i.size === "medium") || imgs.find((i) => i.size === "large") || imgs[imgs.length - 1];
+    return {
+      title: t.name || "Unknown",
+      artist: artistOf(t),
+      playing: !!(t["@attr"] && t["@attr"].nowplaying === "true"),
+      uts: t.date && t.date.uts ? Number(t.date.uts) : 0,
+      artUrl: pick ? pick["#text"] : "",
+      art: null,
+    };
+  });
+
+  // All art lookups run in parallel under one overall time cap.
+  await Promise.all(
+    tracks.map((tr) =>
+      Promise.race([
+        findArt(tr.artUrl, tr.artist, tr.title).then((a) => (tr.art = a)).catch(() => null),
+        new Promise((done) => setTimeout(done, ART_TOTAL_MS)),
+      ])
+    )
+  );
+  tracks.forEach((tr) => delete tr.artUrl);
+  return { ok: true, tracks };
 }
 
-// Short memory + sharing of simultaneous requests.
-function getTrack(user, key, fresh) {
-  const m = memo.get(user);
-  if (!fresh && m && Date.now() - m.ts < MEMO_MS) return Promise.resolve(m.track);
-  if (inflight.has(user)) return inflight.get(user);
+function getTracks(user, key, n, fresh) {
+  const k = `${user}|${n}`;
+  const m = memo.get(k);
+  if (!fresh && m && Date.now() - m.ts < MEMO_MS) return Promise.resolve(m.data);
+  if (inflight.has(k)) return inflight.get(k);
 
-  const p = loadTrack(user, key)
-    .then((track) => {
-      capped(memo, user, { ts: Date.now(), track }, 20);
-      return track;
+  const p = loadTracks(user, key, n)
+    .then((data) => {
+      capped(memo, k, { ts: Date.now(), data }, 20);
+      return data;
     })
-    .finally(() => inflight.delete(user));
-  capped(inflight, user, p, 20);
+    .finally(() => inflight.delete(k));
+  capped(inflight, k, p, 20);
   return p;
 }
 
-// Equalizer bars never change, so build them once.
-const BARS = [0, 1, 2, 3]
-  .map((i) => {
-    const dur = (0.9 + i * 0.15).toFixed(2);
-    return (
-      `<rect x="${268 + i * 7}" y="78" width="4" height="4" class="a">` +
-      `<animate attributeName="height" values="4;16;6;12;4" dur="${dur}s" repeatCount="indefinite"/>` +
-      `<animate attributeName="y" values="86;74;84;78;86" dur="${dur}s" repeatCount="indefinite"/>` +
-      `</rect>`
-    );
-  })
-  .join("");
+// Animated equalizer for the row that is playing right now. cy = vertical center.
+const bars = (cy) =>
+  [0, 1, 2, 3]
+    .map((i) => {
+      const dur = (0.9 + i * 0.15).toFixed(2);
+      const b = cy + 8;
+      return (
+        `<rect x="${W - PAD - 26 + i * 7}" y="${b - 4}" width="4" height="4" class="a">` +
+        `<animate attributeName="height" values="4;16;6;12;4" dur="${dur}s" repeatCount="indefinite"/>` +
+        `<animate attributeName="y" values="${b - 4};${b - 16};${b - 6};${b - 12};${b - 4}" dur="${dur}s" repeatCount="indefinite"/>` +
+        `</rect>`
+      );
+    })
+    .join("");
 
 module.exports = async (req, res) => {
   const q = req.query;
@@ -148,61 +187,108 @@ module.exports = async (req, res) => {
   const key = process.env.LASTFM_API_KEY;
 
   const bg = hex(q.background_color, DEFAULT_BG);
-  const bgFill = q.background_color ? bg : "url(#g)"; // gradient unless a color is passed
+  const bgFill = q.background_color ? bg : "url(#g)";
   const accent = norm(hex(q.accent_color || q.bar_color, DEFAULT_ACCENT));
   const text = norm(hex(q.text_color, DEFAULT_TEXT));
 
-  let track;
+  const asked = q.recent === undefined ? DEFAULT_RECENT : parseInt(q.recent, 10);
+  const n = Math.min(MAX_RECENT, Math.max(1, Number.isNaN(asked) ? DEFAULT_RECENT : asked));
+
+  let data;
   let fellBack = false;
   try {
-    track = await getTrack(user, key, q.fresh === "1");
-    if (track.ok) capped(lastGood, user, track, 20);
+    data = await getTracks(user, key, n, q.fresh === "1");
+    if (data.ok && data.tracks.length) capped(lastGood, user, data, 20);
   } catch (e) {
     fellBack = true;
     const prev = lastGood.get(user);
     if (prev) {
-      track = { ...prev, playing: false };
+      data = { ...prev, tracks: prev.tracks.map((t) => ({ ...t, playing: false })) };
     } else {
-      track = {
-        title: e && e.name === "TimeoutError" ? "Last.fm is slow" : "Couldn't reach Last.fm",
-        artist: "Refresh in a moment",
-        playing: false,
-        art: null,
-        isTrack: false,
+      data = {
+        ok: false,
+        message: e && e.name === "TimeoutError" ? "Last.fm is slow" : "Couldn't reach Last.fm",
+        detail: "Refresh in a moment",
+        tracks: [],
       };
     }
   }
 
-  const { title, artist, playing, art, isTrack } = track;
+  const tracks = data.tracks || [];
+  const first = tracks[0];
+
+  // Status: playing / not listening
+  let status = "";
+  let dot = IDLE_DOT;
+  if (first) {
+    if (first.playing) {
+      status = "NOW LISTENING";
+      dot = ONLINE_DOT;
+    } else {
+      status = "NOT LISTENING";
+    }
+  }
+
   const F = `font-family="-apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"`;
-  const label = (cls, y, size, weight, body, extra = "") =>
-    `<text class="${cls}" x="104" y="${y}" ${F} font-size="${size}" font-weight="${weight}"${extra}>${body}</text>`;
-  const t = esc(clip(title, 22));
-  const a = esc(clip(artist, 24));
-  const status = playing ? "NOW LISTENING" : isTrack ? "LAST PLAYED" : "LAST.FM";
-  const labels =
-    label("a", 32, 10, 700, status, ' letter-spacing="1.2"') +
-    label("t", 54, 16, 700, t) +
-    label("s", 74, 12.5, 400, a);
-  const artEl = art
-    ? `<image href="${art}" x="10" y="10" width="80" height="80" preserveAspectRatio="xMidYMid slice"/>`
-    : `<rect x="10" y="10" width="80" height="80" rx="6" fill="#ffffff" fill-opacity="0.25"/>`;
+  const label = (cls, x, y, size, weight, body, extra = "") =>
+    `<text class="${cls}" x="${x}" y="${y}" ${F} font-size="${size}" font-weight="${weight}"${extra}>${body}</text>`;
+
+  // Header: wordmark + status on the left, username on the right.
+  let out =
+    label("a", PAD, 31, 17, 800, "last.fm", ' letter-spacing="-0.3"') +
+    (status
+      ? `<circle cx="${PAD + 80}" cy="26.5" r="3.5" fill="${dot}"/>` +
+        label("s", PAD + 90, 31, 11, 700, status, ' letter-spacing="1.1"')
+      : label("s", PAD + 80, 31, 12, 400, "Recently Played")) +
+    label("t", W - PAD, 31, 13, 600, esc(clip(user || "unknown", 24)), ' text-anchor="end"');
+
+  out += `<line x1="${PAD}" y1="${HEADER_H}" x2="${W - PAD}" y2="${HEADER_H}" stroke="#ffffff" stroke-opacity="0.18"/>`;
+
+  const defs = [];
+  let rows = "";
+
+  if (!tracks.length) {
+    // Error / empty state: one message row
+    const y = HEADER_H + 8;
+    rows +=
+      `<rect x="${PAD}" y="${y + 7}" width="${THUMB}" height="${THUMB}" rx="6" fill="#ffffff" fill-opacity="0.2"/>` +
+      label("t", PAD + THUMB + 14, y + 25, 14, 700, esc(clip(data.message || "Nothing yet", 40))) +
+      label("s", PAD + THUMB + 14, y + 42, 12, 400, esc(clip(data.detail || "", 48)));
+  } else {
+    tracks.forEach((tr, i) => {
+      const y0 = HEADER_H + 8 + i * ROW_H;
+      const cy = y0 + ROW_H / 2 - 4;
+      const ty = y0 + 7;
+      defs.push(`<clipPath id="c${i}"><rect x="${PAD}" y="${ty}" width="${THUMB}" height="${THUMB}" rx="6"/></clipPath>`);
+      const thumb = tr.art
+        ? `<g clip-path="url(#c${i})"><image href="${tr.art}" x="${PAD}" y="${ty}" width="${THUMB}" height="${THUMB}" preserveAspectRatio="xMidYMid slice"/></g>`
+        : `<rect x="${PAD}" y="${ty}" width="${THUMB}" height="${THUMB}" rx="6" fill="#ffffff" fill-opacity="0.2"/>`;
+      if (i > 0) {
+        rows += `<line x1="${PAD}" y1="${y0 - 4}" x2="${W - PAD}" y2="${y0 - 4}" stroke="#ffffff" stroke-opacity="0.1"/>`;
+      }
+      rows +=
+        thumb +
+        label("t", PAD + THUMB + 14, y0 + 23, 14, i === 0 ? 700 : 600, esc(clip(tr.title, 36))) +
+        label("s", PAD + THUMB + 14, y0 + 40, 12, 400, esc(clip(tr.artist, 42))) +
+        (tr.playing ? bars(cy) : label("s", W - PAD, y0 + 27, 11, 400, esc(ago(tr.uts)), ' text-anchor="end"'));
+    });
+  }
+
+  const count = Math.max(1, tracks.length);
+  const height = HEADER_H + 8 + count * ROW_H + 6;
 
   const svg =
-    `<svg xmlns="http://www.w3.org/2000/svg" width="300" height="100" viewBox="0 0 300 100" text-rendering="geometricPrecision">` +
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${height}" viewBox="0 0 ${W} ${height}" text-rendering="geometricPrecision">` +
     `<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">` +
     `<stop offset="0" stop-color="${GRAD_FROM}"/><stop offset="1" stop-color="${GRAD_TO}"/>` +
-    `</linearGradient></defs>` +
-    `<style>.a{fill:${accent}}.t{fill:${text}}.s{fill:${text};fill-opacity:.85}</style>` +
-    `<rect x="0.5" y="0.5" width="299" height="99" rx="12" fill="${bgFill}" stroke="#ffffff" stroke-opacity="0.18"/>` +
-    `<clipPath id="c"><rect x="10" y="10" width="80" height="80" rx="6"/></clipPath>` +
-    `<g clip-path="url(#c)">${artEl}</g>` +
-    labels +
-    (playing ? BARS : "") +
+    `</linearGradient>${defs.join("")}</defs>` +
+    `<style>.a{fill:${accent}}.t{fill:${text}}.s{fill:${text};fill-opacity:.8}</style>` +
+    `<rect x="0.5" y="0.5" width="${W - 1}" height="${height - 1}" rx="14" fill="${bgFill}" stroke="#ffffff" stroke-opacity="0.18"/>` +
+    out +
+    rows +
     `</svg>`;
 
   res.setHeader("Content-Type", "image/svg+xml");
-  // Errors and fresh=1 are never cached; everything else is served from the edge.
-  res.setHeader("Cache-Control", q.fresh === "1" || fellBack || !track.ok ? CACHE_LIVE : CACHE_FAST);
+  res.setHeader("Cache-Control", q.fresh === "1" || fellBack || !data.ok ? CACHE_LIVE : CACHE_FAST);
   res.status(200).send(svg);
 };
