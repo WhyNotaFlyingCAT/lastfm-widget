@@ -1,9 +1,17 @@
-// Last.fm "now playing" SVG card for Vercel.
+// Last.fm "now playing" SVG card for Vercel (speed-tuned).
 // Env vars: LASTFM_USERNAME, LASTFM_API_KEY
 // Optional URL params: username, background_color (hex, no #), text_color, bar_color
-// Album art: Last.fm first, then iTunes, then Deezer when Last.fm has none.
+// Album art: Last.fm first; if it has none, iTunes and Deezer are tried at the same time.
 
 const PLACEHOLDER_ID = "2a96cbd8b46e442fc41c2b86b821562f"; // Last.fm's default grey star
+const TIMEOUT_MS = 2500;
+
+// Remembers art between requests while the function is warm (skips repeat lookups).
+const artCache = new Map();
+const rememberArt = (k, v) => {
+  if (artCache.size >= 40) artCache.delete(artCache.keys().next().value);
+  artCache.set(k, v);
+};
 
 const esc = (s) =>
   String(s).replace(/[<>&"']/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -12,58 +20,49 @@ const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 
 const hex = (v, fallback) => (/^[0-9a-fA-F]{3,8}$/.test(v || "") ? "#" + v : fallback);
 
-const get = (url) => fetch(url, { signal: AbortSignal.timeout(4000) });
+const get = (url) => fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
 
 async function toDataUri(url) {
-  try {
-    const r = await get(url);
-    if (!r.ok) return null;
-    const type = r.headers.get("content-type") || "image/jpeg";
-    const buf = Buffer.from(await r.arrayBuffer());
-    return `data:${type};base64,${buf.toString("base64")}`;
-  } catch {
-    return null;
-  }
+  const r = await get(url);
+  if (!r.ok) throw new Error("bad image");
+  const type = r.headers.get("content-type") || "image/jpeg";
+  const buf = Buffer.from(await r.arrayBuffer());
+  return `data:${type};base64,${buf.toString("base64")}`;
 }
 
 async function itunesArt(artist, title) {
-  try {
-    const q = encodeURIComponent(`${artist} ${title}`);
-    const r = await get(`https://itunes.apple.com/search?term=${q}&entity=song&limit=1`);
-    const j = await r.json();
-    const u = j.results && j.results[0] && j.results[0].artworkUrl100;
-    return u ? u.replace("100x100", "300x300") : null;
-  } catch {
-    return null;
-  }
+  const q = encodeURIComponent(`${artist} ${title}`);
+  const j = await (await get(`https://itunes.apple.com/search?term=${q}&entity=song&limit=1`)).json();
+  const u = j.results && j.results[0] && j.results[0].artworkUrl100;
+  if (!u) throw new Error("no itunes art");
+  return toDataUri(u.replace("100x100", "200x200"));
 }
 
 async function deezerArt(artist, title) {
-  try {
-    const q = encodeURIComponent(`artist:"${artist}" track:"${title}"`);
-    const r = await get(`https://api.deezer.com/search?q=${q}&limit=1`);
-    const j = await r.json();
-    const a = j.data && j.data[0] && j.data[0].album;
-    return a ? a.cover_medium || a.cover : null;
-  } catch {
-    return null;
-  }
+  const q = encodeURIComponent(`artist:"${artist}" track:"${title}"`);
+  const j = await (await get(`https://api.deezer.com/search?q=${q}&limit=1`)).json();
+  const a = j.data && j.data[0] && j.data[0].album;
+  const u = a && (a.cover_medium || a.cover);
+  if (!u) throw new Error("no deezer art");
+  return toDataUri(u);
 }
 
 async function findArt(lastfmUrl, artist, title) {
+  const key = `${artist}|${title}`;
+  if (artCache.has(key)) return artCache.get(key);
+
+  let art = null;
   if (lastfmUrl && !lastfmUrl.includes(PLACEHOLDER_ID)) {
-    const d = await toDataUri(lastfmUrl);
-    if (d) return d;
+    try {
+      art = await toDataUri(lastfmUrl);
+    } catch {}
   }
-  if (!artist && !title) return null;
-  for (const finder of [itunesArt, deezerArt]) {
-    const url = await finder(artist, title);
-    if (url) {
-      const d = await toDataUri(url);
-      if (d) return d;
-    }
+  if (!art && (artist || title)) {
+    // iTunes and Deezer run in parallel; the first one that returns art wins.
+    art = await Promise.any([itunesArt(artist, title), deezerArt(artist, title)]).catch(() => null);
   }
-  return null;
+  rememberArt(key, art);
+  return art;
 }
 
 module.exports = async (req, res) => {
@@ -93,9 +92,10 @@ module.exports = async (req, res) => {
       title = t.name || title;
       artist = (t.artist && (t.artist["#text"] || t.artist.name)) || "";
       playing = !!(t["@attr"] && t["@attr"].nowplaying === "true");
+      // The card art is only 80px, so the 174px size is plenty and loads faster than 300px.
       const imgs = Array.isArray(t.image) ? t.image : [];
-      const best = imgs.length ? imgs[imgs.length - 1]["#text"] : "";
-      art = await findArt(best, artist, title);
+      const pick = imgs.find((i) => i.size === "large") || imgs[imgs.length - 1];
+      art = await findArt(pick ? pick["#text"] : "", artist, title);
     }
   } catch (e) {
     title = "Couldn't reach Last.fm";
@@ -130,6 +130,7 @@ module.exports = async (req, res) => {
 </svg>`;
 
   res.setHeader("Content-Type", "image/svg+xml");
-  res.setHeader("Cache-Control", "public, s-maxage=30, stale-while-revalidate=60");
+  // No caching on our side, so every fetch gets the current track.
+  res.setHeader("Cache-Control", "no-store, no-cache, max-age=0, must-revalidate");
   res.status(200).send(svg);
 };
