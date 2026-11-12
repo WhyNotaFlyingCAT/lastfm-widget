@@ -73,11 +73,11 @@ async function findArt(lastfmUrl, artist, title) {
 module.exports = async (req, res) => {
   const user = req.query.username || process.env.LASTFM_USERNAME;
   const key = process.env.LASTFM_API_KEY;
-  // Soft pastel coral-rose accent. It contrasts gently with AniList's blue/purple page.
-  const accent = hex(req.query.accent_color || req.query.bar_color, "#f0a4a8");
+  // Pastel blue accent, medium intensity. It sits naturally on AniList's blue/purple page.
+  const accent = hex(req.query.accent_color || req.query.bar_color, "#7fb0ec");
   // No background by default: the card is see-through and blends into whatever page it sits on.
   const bg = req.query.background_color ? hex(req.query.background_color, null) : null;
-  const fg = hex(req.query.text_color, "#f4eef0");
+  const fg = hex(req.query.text_color, "#eef3fb");
   const bar = accent;
 
   let title = "Nothing yet";
@@ -119,9 +119,9 @@ module.exports = async (req, res) => {
 
   const panel = bg
     ? `<rect width="300" height="100" rx="12" fill="${bg}"/>`
-    : `<rect x="0.5" y="0.5" width="299" height="99" rx="12" fill="${accent}" fill-opacity="0.07" stroke="${accent}" stroke-opacity="0.28"/>`;
+    : `<rect x="0.5" y="0.5" width="299" height="99" rx="12" fill="${accent}" fill-opacity="0.10" stroke="${accent}" stroke-opacity="0.35"/>`;
 
-  const status = playing ? "NOW PLAYING" : "LAST PLAYED";
+  const status = playing ? "NOW LISTENING" : "LAST PLAYED";
   const artEl = art
     ? `<image href="${art}" x="10" y="10" width="80" height="80" preserveAspectRatio="xMidYMid slice"/>`
     : `<rect x="10" y="10" width="80" height="80" rx="6" fill="#2a2a2a"/>`;
