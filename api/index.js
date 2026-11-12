@@ -167,26 +167,27 @@ module.exports = async (req, res) => {
   const { title, artist, playing, art, isTrack } = track;
   const resting = !playing && isTrack; // finished playing: "not playing" with the last song below
 
-  const F = 'font-family="Arial, sans-serif"';
+  // System fonts only: an SVG shown as an <img> can't load web fonts, so this picks the nicest one on each device.
+  const F = `font-family="-apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"`;
   const label = (cls, y, size, weight, body, extra = "") =>
     `<text class="${cls}" x="104" y="${y}" ${F} font-size="${size}" font-weight="${weight}"${extra}>${body}</text>`;
   const t = esc(clip(title, 22));
   const a = esc(clip(artist, 24));
   const labels = resting
-    ? label("a", 30, 10, 700, "NOT PLAYING", ' letter-spacing="1"') +
-      label("s", 47, 11, 400, "Last played") +
-      label("t", 66, 14, 700, t) +
-      label("s", 84, 12, 400, a)
-    : label("a", 32, 10, 700, playing ? "NOW LISTENING" : "LAST.FM", ' letter-spacing="1"') +
-      label("t", 54, 15, 700, t) +
-      label("s", 74, 12, 400, a);
+    ? label("a", 28, 10, 700, "NOT PLAYING", ' letter-spacing="1.2"') +
+      label("m", 45, 11, 400, "Last played", ' letter-spacing=".3"') +
+      label("t", 65, 15, 700, t) +
+      label("s", 83, 12, 400, a)
+    : label("a", 32, 10, 700, playing ? "NOW LISTENING" : "LAST.FM", ' letter-spacing="1.2"') +
+      label("t", 54, 16, 700, t) +
+      label("s", 74, 12.5, 400, a);
   const artEl = art
     ? `<image href="${art}" x="10" y="10" width="80" height="80" preserveAspectRatio="xMidYMid slice"/>`
     : `<rect x="10" y="10" width="80" height="80" rx="6" fill="#ffffff" fill-opacity="0.25"/>`;
 
   const svg =
-    `<svg xmlns="http://www.w3.org/2000/svg" width="300" height="100" viewBox="0 0 300 100">` +
-    `<style>.a{fill:${accent}}.t{fill:${text}}.s{fill:${text};fill-opacity:.85}</style>` +
+    `<svg xmlns="http://www.w3.org/2000/svg" width="300" height="100" viewBox="0 0 300 100" text-rendering="geometricPrecision">` +
+    `<style>.a{fill:${accent}}.t{fill:${text}}.s{fill:${text};fill-opacity:.85}.m{fill:${text};fill-opacity:.7}</style>` +
     `<rect x="0.5" y="0.5" width="299" height="99" rx="12" fill="${bg}" stroke="#ffffff" stroke-opacity="0.18"/>` +
     `<clipPath id="c"><rect x="10" y="10" width="80" height="80" rx="6"/></clipPath>` +
     `<g clip-path="url(#c)">${artEl}</g>` +
