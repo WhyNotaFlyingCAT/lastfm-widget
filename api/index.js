@@ -1,37 +1,44 @@
-// Last.fm "now playing" SVG card for Vercel (speed-tuned, black card by default).
+// Last.fm "now playing" SVG card for Vercel. Soft blue card, tuned for speed.
 // Env vars: LASTFM_USERNAME, LASTFM_API_KEY
-// Optional URL params: username, background_color (hex, no #), text_color, accent_color (or bar_color)
+// Optional URL params: username, background_color, text_color, accent_color (hex, no #),
+//                      fresh=1 (skip all caching, always the live track)
 // Album art: Last.fm first; if it has none, iTunes and Deezer are tried at the same time.
 
 const PLACEHOLDER_ID = "2a96cbd8b46e442fc41c2b86b821562f"; // Last.fm's default grey star
-const ART_TIMEOUT_MS = 2500; // album art lookups
-const LASTFM_TIMEOUT_MS = 5000; // the main Last.fm request gets more patience
+const LASTFM_TIMEOUT_MS = 4000;
+const ART_TIMEOUT_MS = 2000;
+const MEMO_MS = 5000; // reuse the same Last.fm answer for a few seconds (bursts of views)
 
-// Last good result, kept while the function is warm. If Last.fm hiccups, the card
-// shows this instead of an error message.
-let lastGood = null;
+const DEFAULT_BG = "#4a7ac0";
+const DEFAULT_ACCENT = "#dbe9ff";
+const DEFAULT_TEXT = "#ffffff";
 
-// Remembers art between requests while the function is warm (skips repeat lookups).
-const artCache = new Map();
-const rememberArt = (k, v) => {
-  if (artCache.size >= 40) artCache.delete(artCache.keys().next().value);
-  artCache.set(k, v);
+// Normal mode: Vercel's edge serves the card instantly and refreshes it in the background.
+// The browser still asks the edge every time (max-age=0), so a new song shows up within ~10-30s.
+const CACHE_FAST = "public, max-age=0, s-maxage=10, stale-while-revalidate=20";
+const CACHE_LIVE = "no-store, no-cache, max-age=0, must-revalidate";
+
+let lastGood = null; // last good track, shown if Last.fm hiccups
+
+const artCache = new Map(); // "artist|title" -> data URI
+const memo = new Map(); // user -> { ts, track }
+const inflight = new Map(); // user -> Promise (so simultaneous views share one request)
+
+const capped = (map, k, v, max) => {
+  if (map.size >= max) map.delete(map.keys().next().value);
+  map.set(k, v);
 };
 
-const esc = (s) =>
-  String(s).replace(/[<>&"']/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&#39;" }[c]));
-
+const ESC = { "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&#39;" };
+const esc = (s) => String(s).replace(/[<>&"']/g, (c) => ESC[c]);
 const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
-
 const hex = (v, fallback) => (/^[0-9a-fA-F]{3,8}$/.test(v || "") ? "#" + v : fallback);
-
-// "#abc" -> "#aabbcc", and drop any alpha digits
 const norm = (h) => (!h ? null : h.length === 4 ? "#" + [...h.slice(1)].map((c) => c + c).join("") : h.slice(0, 7));
 
-const get = (url, ms = ART_TIMEOUT_MS) => fetch(url, { signal: AbortSignal.timeout(ms) });
+const get = (url, ms) => fetch(url, { signal: AbortSignal.timeout(ms) });
 
 async function toDataUri(url) {
-  const r = await get(url);
+  const r = await get(url, ART_TIMEOUT_MS);
   if (!r.ok) throw new Error("bad image");
   const type = r.headers.get("content-type") || "image/jpeg";
   const buf = Buffer.from(await r.arrayBuffer());
@@ -40,7 +47,8 @@ async function toDataUri(url) {
 
 async function itunesArt(artist, title) {
   const q = encodeURIComponent(`${artist} ${title}`);
-  const j = await (await get(`https://itunes.apple.com/search?term=${q}&entity=song&limit=1`)).json();
+  const r = await get(`https://itunes.apple.com/search?term=${q}&entity=song&limit=1`, ART_TIMEOUT_MS);
+  const j = await r.json();
   const u = j.results && j.results[0] && j.results[0].artworkUrl100;
   if (!u) throw new Error("no itunes art");
   return toDataUri(u.replace("100x100", "200x200"));
@@ -48,7 +56,8 @@ async function itunesArt(artist, title) {
 
 async function deezerArt(artist, title) {
   const q = encodeURIComponent(`artist:"${artist}" track:"${title}"`);
-  const j = await (await get(`https://api.deezer.com/search?q=${q}&limit=1`)).json();
+  const r = await get(`https://api.deezer.com/search?q=${q}&limit=1`, ART_TIMEOUT_MS);
+  const j = await r.json();
   const a = j.data && j.data[0] && j.data[0].album;
   const u = a && (a.cover_medium || a.cover);
   if (!u) throw new Error("no deezer art");
@@ -66,94 +75,127 @@ async function findArt(lastfmUrl, artist, title) {
     } catch {}
   }
   if (!art && (artist || title)) {
-    // iTunes and Deezer run in parallel; the first one that returns art wins.
+    // Both fallbacks run at the same time; the first one with art wins.
     art = await Promise.any([itunesArt(artist, title), deezerArt(artist, title)]).catch(() => null);
   }
-  rememberArt(key, art);
+  capped(artCache, key, art, 40);
   return art;
 }
 
+// One trip to Last.fm. Returns { ok, title, artist, playing, art }.
+async function loadTrack(user, key) {
+  const api =
+    "https://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&limit=1&format=json" +
+    `&user=${encodeURIComponent(user)}&api_key=${encodeURIComponent(key)}`;
+  const data = await (await get(api, LASTFM_TIMEOUT_MS)).json();
+
+  if (data && data.error) {
+    return { ok: false, title: "Last.fm error " + data.error, artist: String(data.message || ""), playing: false, art: null, isTrack: false };
+  }
+
+  let t = data && data.recenttracks && data.recenttracks.track;
+  if (Array.isArray(t)) t = t[0];
+  if (!t) return { ok: true, title: "Nothing yet", artist: "", playing: false, art: null, isTrack: false };
+
+  const title = t.name || "Nothing yet";
+  const artist = (t.artist && (t.artist["#text"] || t.artist.name)) || "";
+  const playing = !!(t["@attr"] && t["@attr"].nowplaying === "true");
+  const imgs = Array.isArray(t.image) ? t.image : [];
+  const pick = imgs.find((i) => i.size === "large") || imgs[imgs.length - 1];
+  const art = await findArt(pick ? pick["#text"] : "", artist, title);
+  return { ok: true, title, artist, playing, art, isTrack: true };
+}
+
+// Short memory + sharing of simultaneous requests.
+function getTrack(user, key) {
+  const m = memo.get(user);
+  if (m && Date.now() - m.ts < MEMO_MS) return Promise.resolve(m.track);
+  if (inflight.has(user)) return inflight.get(user);
+
+  const p = loadTrack(user, key)
+    .then((track) => {
+      capped(memo, user, { ts: Date.now(), track }, 20);
+      return track;
+    })
+    .finally(() => inflight.delete(user));
+  capped(inflight, user, p, 20);
+  return p;
+}
+
+// Equalizer bars never change, so build them once.
+const BARS = [0, 1, 2, 3]
+  .map((i) => {
+    const dur = (0.9 + i * 0.15).toFixed(2);
+    return (
+      `<rect x="${268 + i * 7}" y="78" width="4" height="4" class="a">` +
+      `<animate attributeName="height" values="4;16;6;12;4" dur="${dur}s" repeatCount="indefinite"/>` +
+      `<animate attributeName="y" values="86;74;84;78;86" dur="${dur}s" repeatCount="indefinite"/>` +
+      `</rect>`
+    );
+  })
+  .join("");
+
 module.exports = async (req, res) => {
-  const user = req.query.username || process.env.LASTFM_USERNAME;
+  const q = req.query;
+  const user = q.username || process.env.LASTFM_USERNAME;
   const key = process.env.LASTFM_API_KEY;
 
-  // Fixed colors: black card by default, so it looks the same on any AniList theme.
-  const accent = norm(hex(req.query.accent_color || req.query.bar_color, "#7fb0ec"));
-  const text = norm(hex(req.query.text_color, "#eef3fb"));
-  const bg = hex(req.query.background_color, "#000000");
+  const bg = hex(q.background_color, DEFAULT_BG);
+  const accent = norm(hex(q.accent_color || q.bar_color, DEFAULT_ACCENT));
+  const text = norm(hex(q.text_color, DEFAULT_TEXT));
 
-  let title = "Nothing yet";
-  let artist = "";
-  let playing = false;
-  let art = null;
-
+  let track;
+  let fellBack = false;
   try {
-    const api =
-      "https://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&limit=1&format=json" +
-      `&user=${encodeURIComponent(user)}&api_key=${encodeURIComponent(key)}`;
-    const data = await (await get(api, LASTFM_TIMEOUT_MS)).json();
-    if (data && data.error) {
-      title = "Last.fm error " + data.error;
-      artist = String(data.message || "");
-    }
-    let t = data && data.recenttracks && data.recenttracks.track;
-    if (Array.isArray(t)) t = t[0];
-    if (t) {
-      title = t.name || title;
-      artist = (t.artist && (t.artist["#text"] || t.artist.name)) || "";
-      playing = !!(t["@attr"] && t["@attr"].nowplaying === "true");
-      // The card art is only 80px, so the large size is plenty and loads faster than the biggest.
-      const imgs = Array.isArray(t.image) ? t.image : [];
-      const pick = imgs.find((i) => i.size === "large") || imgs[imgs.length - 1];
-      art = await findArt(pick ? pick["#text"] : "", artist, title);
-      lastGood = { title, artist, art };
-    }
+    track = await getTrack(user, key);
+    if (track.ok) lastGood = track;
   } catch (e) {
+    fellBack = true;
     if (lastGood) {
-      // Show the last track we saw instead of an error.
-      ({ title, artist, art } = lastGood);
-      playing = false;
+      track = { ...lastGood, playing: false };
     } else {
-      title = e && e.name === "TimeoutError" ? "Last.fm is slow" : "Couldn't reach Last.fm";
-      artist = "Refresh in a moment";
+      track = {
+        title: e && e.name === "TimeoutError" ? "Last.fm is slow" : "Couldn't reach Last.fm",
+        artist: "Refresh in a moment",
+        playing: false,
+        art: null,
+        isTrack: false,
+      };
     }
   }
 
-  const panel = `<rect width="300" height="100" rx="12" fill="${bg}"/>`;
+  const { title, artist, playing, art, isTrack } = track;
+  const resting = !playing && isTrack; // finished playing: "not playing" with the last song below
 
-  const css = `.a{fill:${accent}}.t{fill:${text}}.s{fill:${text};fill-opacity:.7}`;
-
-  const status = playing ? "NOW LISTENING" : "LAST PLAYED";
+  const F = 'font-family="Arial, sans-serif"';
+  const label = (cls, y, size, weight, body, extra = "") =>
+    `<text class="${cls}" x="104" y="${y}" ${F} font-size="${size}" font-weight="${weight}"${extra}>${body}</text>`;
+  const t = esc(clip(title, 22));
+  const a = esc(clip(artist, 24));
+  const labels = resting
+    ? label("a", 30, 10, 700, "NOT PLAYING", ' letter-spacing="1"') +
+      label("s", 47, 11, 400, "Last played") +
+      label("t", 66, 14, 700, t) +
+      label("s", 84, 12, 400, a)
+    : label("a", 32, 10, 700, playing ? "NOW LISTENING" : "LAST.FM", ' letter-spacing="1"') +
+      label("t", 54, 15, 700, t) +
+      label("s", 74, 12, 400, a);
   const artEl = art
     ? `<image href="${art}" x="10" y="10" width="80" height="80" preserveAspectRatio="xMidYMid slice"/>`
-    : `<rect x="10" y="10" width="80" height="80" rx="6" fill="#8fa3bd" fill-opacity="0.35"/>`;
+    : `<rect x="10" y="10" width="80" height="80" rx="6" fill="#ffffff" fill-opacity="0.25"/>`;
 
-  // Animated equalizer bars only while playing
-  const bars = playing
-    ? [0, 1, 2, 3]
-        .map(
-          (i) =>
-            `<rect x="${268 + i * 7}" y="78" width="4" height="4" class="a">` +
-            `<animate attributeName="height" values="4;16;6;12;4" dur="${0.9 + i * 0.15}s" repeatCount="indefinite"/>` +
-            `<animate attributeName="y" values="86;74;84;78;86" dur="${0.9 + i * 0.15}s" repeatCount="indefinite"/>` +
-            `</rect>`
-        )
-        .join("")
-    : "";
-
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="300" height="100" viewBox="0 0 300 100">
-  <style>${css}</style>
-  ${panel}
-  <clipPath id="c"><rect x="10" y="10" width="80" height="80" rx="6"/></clipPath>
-  <g clip-path="url(#c)">${artEl}</g>
-  <text class="a" x="104" y="32" font-family="Arial, sans-serif" font-size="10" font-weight="700" letter-spacing="1">${status}</text>
-  <text class="t" x="104" y="54" font-family="Arial, sans-serif" font-size="15" font-weight="700">${esc(clip(title, 22))}</text>
-  <text class="s" x="104" y="74" font-family="Arial, sans-serif" font-size="12">${esc(clip(artist, 24))}</text>
-  ${bars}
-</svg>`;
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="300" height="100" viewBox="0 0 300 100">` +
+    `<style>.a{fill:${accent}}.t{fill:${text}}.s{fill:${text};fill-opacity:.85}</style>` +
+    `<rect x="0.5" y="0.5" width="299" height="99" rx="12" fill="${bg}" stroke="#ffffff" stroke-opacity="0.18"/>` +
+    `<clipPath id="c"><rect x="10" y="10" width="80" height="80" rx="6"/></clipPath>` +
+    `<g clip-path="url(#c)">${artEl}</g>` +
+    labels +
+    (playing ? BARS : "") +
+    `</svg>`;
 
   res.setHeader("Content-Type", "image/svg+xml");
-  // No caching on our side, so every fetch gets the current track.
-  res.setHeader("Cache-Control", "no-store, no-cache, max-age=0, must-revalidate");
+  // Errors and fresh=1 are never cached; everything else is served from the edge.
+  res.setHeader("Cache-Control", q.fresh === "1" || fellBack || !track.ok ? CACHE_LIVE : CACHE_FAST);
   res.status(200).send(svg);
 };
