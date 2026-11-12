@@ -174,10 +174,10 @@ module.exports = async (req, res) => {
   const t = esc(clip(title, 22));
   const a = esc(clip(artist, 24));
   const labels = resting
-    ? label("a", 28, 10, 700, "NOT PLAYING", ' letter-spacing="1.2"') +
-      label("m", 45, 11, 400, "Last played", ' letter-spacing=".3"') +
-      label("t", 65, 15, 700, t) +
-      label("s", 83, 12, 400, a)
+    ? label("a", 26, 10, 700, "NOT PLAYING", ' letter-spacing="1.2"') +
+      label("m", 51, 11, 400, "Last played", ' letter-spacing=".3"') +
+      label("t", 68, 15, 700, t) +
+      label("s", 85, 12, 400, a)
     : label("a", 32, 10, 700, playing ? "NOW LISTENING" : "LAST.FM", ' letter-spacing="1.2"') +
       label("t", 54, 16, 700, t) +
       label("s", 74, 12.5, 400, a);
