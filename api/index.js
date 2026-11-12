@@ -1,6 +1,6 @@
-// Last.fm "now playing" SVG card for Vercel (speed-tuned).
+// Last.fm "now playing" SVG card for Vercel (speed-tuned, black card by default).
 // Env vars: LASTFM_USERNAME, LASTFM_API_KEY
-// Optional URL params: username, background_color (hex, no #), text_color, bar_color
+// Optional URL params: username, background_color (hex, no #), text_color, accent_color (or bar_color)
 // Album art: Last.fm first; if it has none, iTunes and Deezer are tried at the same time.
 
 const PLACEHOLDER_ID = "2a96cbd8b46e442fc41c2b86b821562f"; // Last.fm's default grey star
@@ -27,13 +27,6 @@ const hex = (v, fallback) => (/^[0-9a-fA-F]{3,8}$/.test(v || "") ? "#" + v : fal
 
 // "#abc" -> "#aabbcc", and drop any alpha digits
 const norm = (h) => (!h ? null : h.length === 4 ? "#" + [...h.slice(1)].map((c) => c + c).join("") : h.slice(0, 7));
-
-// Mix a color toward black. Used to make the pastel accent readable on light pages.
-const darken = (h, f) => {
-  const n = parseInt(h.slice(1, 7), 16);
-  const c = [16, 8, 0].map((s) => Math.round(((n >> s) & 255) * (1 - f)));
-  return "#" + c.map((v) => v.toString(16).padStart(2, "0")).join("");
-};
 
 const get = (url, ms = ART_TIMEOUT_MS) => fetch(url, { signal: AbortSignal.timeout(ms) });
 
@@ -83,17 +76,11 @@ async function findArt(lastfmUrl, artist, title) {
 module.exports = async (req, res) => {
   const user = req.query.username || process.env.LASTFM_USERNAME;
   const key = process.env.LASTFM_API_KEY;
-  // Pastel blue accent. The card has no background by default, so it blends into the page.
-  // theme=auto (default) follows the viewer's light/dark setting; theme=light or theme=dark forces one.
-  const theme = ["light", "dark"].includes(req.query.theme) ? req.query.theme : "auto";
-  const accentIn = norm(hex(req.query.accent_color || req.query.bar_color, "#7fb0ec"));
-  const textIn = req.query.text_color ? norm(hex(req.query.text_color, null)) : null;
-  const bg = req.query.background_color ? hex(req.query.background_color, null) : null;
-  const mode = bg && theme === "auto" ? "dark" : theme; // a solid background keeps fixed colors
-  const DARK = { accent: accentIn, text: textIn || "#eef3fb" };
-  // Light pages need a deeper blue to stay readable. A custom accent is darkened instead.
-  const customAccent = req.query.accent_color || req.query.bar_color;
-  const LIGHT = { accent: customAccent ? darken(accentIn, 0.28) : "#4b84cf", text: textIn || "#1f2d40" };
+
+  // Fixed colors: black card by default, so it looks the same on any AniList theme.
+  const accent = norm(hex(req.query.accent_color || req.query.bar_color, "#7fb0ec"));
+  const text = norm(hex(req.query.text_color, "#eef3fb"));
+  const bg = hex(req.query.background_color, "#000000");
 
   let title = "Nothing yet";
   let artist = "";
@@ -115,7 +102,7 @@ module.exports = async (req, res) => {
       title = t.name || title;
       artist = (t.artist && (t.artist["#text"] || t.artist.name)) || "";
       playing = !!(t["@attr"] && t["@attr"].nowplaying === "true");
-      // The card art is only 80px, so the 174px size is plenty and loads faster than 300px.
+      // The card art is only 80px, so the large size is plenty and loads faster than the biggest.
       const imgs = Array.isArray(t.image) ? t.image : [];
       const pick = imgs.find((i) => i.size === "large") || imgs[imgs.length - 1];
       art = await findArt(pick ? pick["#text"] : "", artist, title);
@@ -132,16 +119,9 @@ module.exports = async (req, res) => {
     }
   }
 
-  const panel = bg
-    ? `<rect width="300" height="100" rx="12" fill="${bg}"/>`
-    : `<rect class="p" x="0.5" y="0.5" width="299" height="99" rx="12" fill-opacity="0.10" stroke-opacity="0.35"/>`;
+  const panel = `<rect width="300" height="100" rx="12" fill="${bg}"/>`;
 
-  // Colors live in CSS so the card can switch between light and dark versions.
-  const base = mode === "light" ? LIGHT : DARK;
-  let css = `.a{fill:${base.accent}}.t{fill:${base.text}}.s{fill:${base.text};fill-opacity:.7}.p{fill:${base.accent};stroke:${base.accent}}`;
-  if (mode === "auto") {
-    css += `@media (prefers-color-scheme: light){.a{fill:${LIGHT.accent}}.t{fill:${LIGHT.text}}.s{fill:${LIGHT.text}}.p{fill:${LIGHT.accent};stroke:${LIGHT.accent}}}`;
-  }
+  const css = `.a{fill:${accent}}.t{fill:${text}}.s{fill:${text};fill-opacity:.7}`;
 
   const status = playing ? "NOW LISTENING" : "LAST PLAYED";
   const artEl = art
