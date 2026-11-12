@@ -9,9 +9,9 @@ const LASTFM_TIMEOUT_MS = 4000;
 const ART_TIMEOUT_MS = 2000;
 const MEMO_MS = 5000; // reuse the same Last.fm answer for a few seconds (bursts of views)
 
-const DEFAULT_BG = "#4a7ac0";
-const DEFAULT_ACCENT = "#dbe9ff";
-const DEFAULT_TEXT = "#ffffff";
+const DEFAULT_BG = "#3d5c8c";
+const DEFAULT_ACCENT = "#b9cdea";
+const DEFAULT_TEXT = "#f2f6fc";
 
 // Normal mode: Vercel's edge serves the card instantly and refreshes it in the background.
 // The browser still asks the edge every time (max-age=0), so a new song shows up within ~10-30s.
@@ -165,29 +165,23 @@ module.exports = async (req, res) => {
   }
 
   const { title, artist, playing, art, isTrack } = track;
-  const resting = !playing && isTrack; // finished playing: "not playing" with the last song below
-
-  // System fonts only: an SVG shown as an <img> can't load web fonts, so this picks the nicest one on each device.
   const F = `font-family="-apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"`;
   const label = (cls, y, size, weight, body, extra = "") =>
     `<text class="${cls}" x="104" y="${y}" ${F} font-size="${size}" font-weight="${weight}"${extra}>${body}</text>`;
   const t = esc(clip(title, 22));
   const a = esc(clip(artist, 24));
-  const labels = resting
-    ? label("a", 26, 10, 700, "NOT PLAYING", ' letter-spacing="1.2"') +
-      label("m", 51, 11, 400, "Last played", ' letter-spacing=".3"') +
-      label("t", 68, 15, 700, t) +
-      label("s", 85, 12, 400, a)
-    : label("a", 32, 10, 700, playing ? "NOW LISTENING" : "LAST.FM", ' letter-spacing="1.2"') +
-      label("t", 54, 16, 700, t) +
-      label("s", 74, 12.5, 400, a);
+  const status = playing ? "NOW LISTENING" : isTrack ? "LAST PLAYED" : "LAST.FM";
+  const labels =
+    label("a", 32, 10, 700, status, ' letter-spacing="1.2"') +
+    label("t", 54, 16, 700, t) +
+    label("s", 74, 12.5, 400, a);
   const artEl = art
     ? `<image href="${art}" x="10" y="10" width="80" height="80" preserveAspectRatio="xMidYMid slice"/>`
     : `<rect x="10" y="10" width="80" height="80" rx="6" fill="#ffffff" fill-opacity="0.25"/>`;
 
   const svg =
     `<svg xmlns="http://www.w3.org/2000/svg" width="300" height="100" viewBox="0 0 300 100" text-rendering="geometricPrecision">` +
-    `<style>.a{fill:${accent}}.t{fill:${text}}.s{fill:${text};fill-opacity:.85}.m{fill:${text};fill-opacity:.7}</style>` +
+    `<style>.a{fill:${accent}}.t{fill:${text}}.s{fill:${text};fill-opacity:.85}</style>` +
     `<rect x="0.5" y="0.5" width="299" height="99" rx="12" fill="${bg}" stroke="#ffffff" stroke-opacity="0.18"/>` +
     `<clipPath id="c"><rect x="10" y="10" width="80" height="80" rx="6"/></clipPath>` +
     `<g clip-path="url(#c)">${artEl}</g>` +
