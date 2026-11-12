@@ -7,6 +7,7 @@
 const PLACEHOLDER_ID = "2a96cbd8b46e442fc41c2b86b821562f"; // Last.fm's default grey star
 const LASTFM_TIMEOUT_MS = 4000;
 const ART_TIMEOUT_MS = 2000;
+const ART_TOTAL_MS = 2500; // hard cap on all art lookups together, so the card never stalls
 const MEMO_MS = 5000; // reuse the same Last.fm answer for a few seconds (bursts of views)
 
 const DEFAULT_BG = "#3d5c8c";
@@ -20,7 +21,7 @@ const DEFAULT_TEXT = "#f2f6fc";
 const CACHE_FAST = "public, max-age=0, s-maxage=10, stale-while-revalidate=20";
 const CACHE_LIVE = "no-store, no-cache, max-age=0, must-revalidate";
 
-let lastGood = null; // last good track, shown if Last.fm hiccups
+const lastGood = new Map(); // user -> last good track, shown if Last.fm hiccups
 
 const artCache = new Map(); // "artist|title" -> data URI
 const memo = new Map(); // user -> { ts, track }
@@ -34,7 +35,7 @@ const capped = (map, k, v, max) => {
 const ESC = { "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&#39;" };
 const esc = (s) => String(s).replace(/[<>&"']/g, (c) => ESC[c]);
 const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
-const hex = (v, fallback) => (/^[0-9a-fA-F]{3,8}$/.test(v || "") ? "#" + v : fallback);
+const hex = (v, fallback) => (/^([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(v || "") ? "#" + v : fallback);
 const norm = (h) => (!h ? null : h.length === 4 ? "#" + [...h.slice(1)].map((c) => c + c).join("") : h.slice(0, 7));
 
 const get = (url, ms) => fetch(url, { signal: AbortSignal.timeout(ms) });
@@ -42,7 +43,8 @@ const get = (url, ms) => fetch(url, { signal: AbortSignal.timeout(ms) });
 async function toDataUri(url) {
   const r = await get(url, ART_TIMEOUT_MS);
   if (!r.ok) throw new Error("bad image");
-  const type = r.headers.get("content-type") || "image/jpeg";
+  const ct = (r.headers.get("content-type") || "").split(";")[0].trim();
+  const type = /^image\/[\w.+-]+$/.test(ct) ? ct : "image/jpeg";
   const buf = Buffer.from(await r.arrayBuffer());
   return `data:${type};base64,${buf.toString("base64")}`;
 }
@@ -80,7 +82,7 @@ async function findArt(lastfmUrl, artist, title) {
     // Both fallbacks run at the same time; the first one with art wins.
     art = await Promise.any([itunesArt(artist, title), deezerArt(artist, title)]).catch(() => null);
   }
-  capped(artCache, key, art, 40);
+  if (art) capped(artCache, key, art, 40); // failures are retried next time
   return art;
 }
 
@@ -104,14 +106,17 @@ async function loadTrack(user, key) {
   const playing = !!(t["@attr"] && t["@attr"].nowplaying === "true");
   const imgs = Array.isArray(t.image) ? t.image : [];
   const pick = imgs.find((i) => i.size === "large") || imgs[imgs.length - 1];
-  const art = await findArt(pick ? pick["#text"] : "", artist, title);
+  const art = await Promise.race([
+    findArt(pick ? pick["#text"] : "", artist, title),
+    new Promise((done) => setTimeout(() => done(null), ART_TOTAL_MS)),
+  ]);
   return { ok: true, title, artist, playing, art, isTrack: true };
 }
 
 // Short memory + sharing of simultaneous requests.
-function getTrack(user, key) {
+function getTrack(user, key, fresh) {
   const m = memo.get(user);
-  if (m && Date.now() - m.ts < MEMO_MS) return Promise.resolve(m.track);
+  if (!fresh && m && Date.now() - m.ts < MEMO_MS) return Promise.resolve(m.track);
   if (inflight.has(user)) return inflight.get(user);
 
   const p = loadTrack(user, key)
@@ -150,12 +155,13 @@ module.exports = async (req, res) => {
   let track;
   let fellBack = false;
   try {
-    track = await getTrack(user, key);
-    if (track.ok) lastGood = track;
+    track = await getTrack(user, key, q.fresh === "1");
+    if (track.ok) capped(lastGood, user, track, 20);
   } catch (e) {
     fellBack = true;
-    if (lastGood) {
-      track = { ...lastGood, playing: false };
+    const prev = lastGood.get(user);
+    if (prev) {
+      track = { ...prev, playing: false };
     } else {
       track = {
         title: e && e.name === "TimeoutError" ? "Last.fm is slow" : "Couldn't reach Last.fm",
