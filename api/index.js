@@ -4,7 +4,12 @@
 // Album art: Last.fm first; if it has none, iTunes and Deezer are tried at the same time.
 
 const PLACEHOLDER_ID = "2a96cbd8b46e442fc41c2b86b821562f"; // Last.fm's default grey star
-const TIMEOUT_MS = 2500;
+const ART_TIMEOUT_MS = 2500; // album art lookups
+const LASTFM_TIMEOUT_MS = 5000; // the main Last.fm request gets more patience
+
+// Last good result, kept while the function is warm. If Last.fm hiccups, the card
+// shows this instead of an error message.
+let lastGood = null;
 
 // Remembers art between requests while the function is warm (skips repeat lookups).
 const artCache = new Map();
@@ -20,7 +25,7 @@ const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 
 const hex = (v, fallback) => (/^[0-9a-fA-F]{3,8}$/.test(v || "") ? "#" + v : fallback);
 
-const get = (url) => fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+const get = (url, ms = ART_TIMEOUT_MS) => fetch(url, { signal: AbortSignal.timeout(ms) });
 
 async function toDataUri(url) {
   const r = await get(url);
@@ -84,7 +89,7 @@ module.exports = async (req, res) => {
     const api =
       "https://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&limit=1&format=json" +
       `&user=${encodeURIComponent(user)}&api_key=${encodeURIComponent(key)}`;
-    const data = await (await get(api)).json();
+    const data = await (await get(api, LASTFM_TIMEOUT_MS)).json();
     if (data && data.error) {
       title = "Last.fm error " + data.error;
       artist = String(data.message || "");
@@ -99,9 +104,17 @@ module.exports = async (req, res) => {
       const imgs = Array.isArray(t.image) ? t.image : [];
       const pick = imgs.find((i) => i.size === "large") || imgs[imgs.length - 1];
       art = await findArt(pick ? pick["#text"] : "", artist, title);
+      lastGood = { title, artist, art };
     }
   } catch (e) {
-    title = "Couldn't reach Last.fm";
+    if (lastGood) {
+      // Show the last track we saw instead of an error.
+      ({ title, artist, art } = lastGood);
+      playing = false;
+    } else {
+      title = e && e.name === "TimeoutError" ? "Last.fm is slow" : "Couldn't reach Last.fm";
+      artist = "Refresh in a moment";
+    }
   }
 
   const panel = bg
