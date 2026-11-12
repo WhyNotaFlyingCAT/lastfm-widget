@@ -10,6 +10,8 @@ const ART_TIMEOUT_MS = 2000;
 const MEMO_MS = 5000; // reuse the same Last.fm answer for a few seconds (bursts of views)
 
 const DEFAULT_BG = "#3d5c8c";
+const GRAD_FROM = "#4a74b0"; // gradient: lighter blue (top-left)
+const GRAD_TO = "#2f4c7a"; // gradient: deeper blue (bottom-right)
 const DEFAULT_ACCENT = "#b9cdea";
 const DEFAULT_TEXT = "#f2f6fc";
 
@@ -141,6 +143,7 @@ module.exports = async (req, res) => {
   const key = process.env.LASTFM_API_KEY;
 
   const bg = hex(q.background_color, DEFAULT_BG);
+  const bgFill = q.background_color ? bg : "url(#g)"; // gradient unless a color is passed
   const accent = norm(hex(q.accent_color || q.bar_color, DEFAULT_ACCENT));
   const text = norm(hex(q.text_color, DEFAULT_TEXT));
 
@@ -181,8 +184,11 @@ module.exports = async (req, res) => {
 
   const svg =
     `<svg xmlns="http://www.w3.org/2000/svg" width="300" height="100" viewBox="0 0 300 100" text-rendering="geometricPrecision">` +
+    `<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">` +
+    `<stop offset="0" stop-color="${GRAD_FROM}"/><stop offset="1" stop-color="${GRAD_TO}"/>` +
+    `</linearGradient></defs>` +
     `<style>.a{fill:${accent}}.t{fill:${text}}.s{fill:${text};fill-opacity:.85}</style>` +
-    `<rect x="0.5" y="0.5" width="299" height="99" rx="12" fill="${bg}" stroke="#ffffff" stroke-opacity="0.18"/>` +
+    `<rect x="0.5" y="0.5" width="299" height="99" rx="12" fill="${bgFill}" stroke="#ffffff" stroke-opacity="0.18"/>` +
     `<clipPath id="c"><rect x="10" y="10" width="80" height="80" rx="6"/></clipPath>` +
     `<g clip-path="url(#c)">${artEl}</g>` +
     labels +
