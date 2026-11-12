@@ -25,6 +25,16 @@ const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 
 const hex = (v, fallback) => (/^[0-9a-fA-F]{3,8}$/.test(v || "") ? "#" + v : fallback);
 
+// "#abc" -> "#aabbcc", and drop any alpha digits
+const norm = (h) => (!h ? null : h.length === 4 ? "#" + [...h.slice(1)].map((c) => c + c).join("") : h.slice(0, 7));
+
+// Mix a color toward black. Used to make the pastel accent readable on light pages.
+const darken = (h, f) => {
+  const n = parseInt(h.slice(1, 7), 16);
+  const c = [16, 8, 0].map((s) => Math.round(((n >> s) & 255) * (1 - f)));
+  return "#" + c.map((v) => v.toString(16).padStart(2, "0")).join("");
+};
+
 const get = (url, ms = ART_TIMEOUT_MS) => fetch(url, { signal: AbortSignal.timeout(ms) });
 
 async function toDataUri(url) {
@@ -73,12 +83,17 @@ async function findArt(lastfmUrl, artist, title) {
 module.exports = async (req, res) => {
   const user = req.query.username || process.env.LASTFM_USERNAME;
   const key = process.env.LASTFM_API_KEY;
-  // Pastel blue accent, medium intensity. It sits naturally on AniList's blue/purple page.
-  const accent = hex(req.query.accent_color || req.query.bar_color, "#7fb0ec");
-  // No background by default: the card is see-through and blends into whatever page it sits on.
+  // Pastel blue accent. The card has no background by default, so it blends into the page.
+  // theme=auto (default) follows the viewer's light/dark setting; theme=light or theme=dark forces one.
+  const theme = ["light", "dark"].includes(req.query.theme) ? req.query.theme : "auto";
+  const accentIn = norm(hex(req.query.accent_color || req.query.bar_color, "#7fb0ec"));
+  const textIn = req.query.text_color ? norm(hex(req.query.text_color, null)) : null;
   const bg = req.query.background_color ? hex(req.query.background_color, null) : null;
-  const fg = hex(req.query.text_color, "#eef3fb");
-  const bar = accent;
+  const mode = bg && theme === "auto" ? "dark" : theme; // a solid background keeps fixed colors
+  const DARK = { accent: accentIn, text: textIn || "#eef3fb" };
+  // Light pages need a deeper blue to stay readable. A custom accent is darkened instead.
+  const customAccent = req.query.accent_color || req.query.bar_color;
+  const LIGHT = { accent: customAccent ? darken(accentIn, 0.28) : "#4b84cf", text: textIn || "#1f2d40" };
 
   let title = "Nothing yet";
   let artist = "";
@@ -119,19 +134,26 @@ module.exports = async (req, res) => {
 
   const panel = bg
     ? `<rect width="300" height="100" rx="12" fill="${bg}"/>`
-    : `<rect x="0.5" y="0.5" width="299" height="99" rx="12" fill="${accent}" fill-opacity="0.10" stroke="${accent}" stroke-opacity="0.35"/>`;
+    : `<rect class="p" x="0.5" y="0.5" width="299" height="99" rx="12" fill-opacity="0.10" stroke-opacity="0.35"/>`;
+
+  // Colors live in CSS so the card can switch between light and dark versions.
+  const base = mode === "light" ? LIGHT : DARK;
+  let css = `.a{fill:${base.accent}}.t{fill:${base.text}}.s{fill:${base.text};fill-opacity:.7}.p{fill:${base.accent};stroke:${base.accent}}`;
+  if (mode === "auto") {
+    css += `@media (prefers-color-scheme: light){.a{fill:${LIGHT.accent}}.t{fill:${LIGHT.text}}.s{fill:${LIGHT.text}}.p{fill:${LIGHT.accent};stroke:${LIGHT.accent}}}`;
+  }
 
   const status = playing ? "NOW LISTENING" : "LAST PLAYED";
   const artEl = art
     ? `<image href="${art}" x="10" y="10" width="80" height="80" preserveAspectRatio="xMidYMid slice"/>`
-    : `<rect x="10" y="10" width="80" height="80" rx="6" fill="#2a2a2a"/>`;
+    : `<rect x="10" y="10" width="80" height="80" rx="6" fill="#8fa3bd" fill-opacity="0.35"/>`;
 
   // Animated equalizer bars only while playing
   const bars = playing
     ? [0, 1, 2, 3]
         .map(
           (i) =>
-            `<rect x="${268 + i * 7}" y="78" width="4" height="4" fill="${bar}">` +
+            `<rect x="${268 + i * 7}" y="78" width="4" height="4" class="a">` +
             `<animate attributeName="height" values="4;16;6;12;4" dur="${0.9 + i * 0.15}s" repeatCount="indefinite"/>` +
             `<animate attributeName="y" values="86;74;84;78;86" dur="${0.9 + i * 0.15}s" repeatCount="indefinite"/>` +
             `</rect>`
@@ -140,12 +162,13 @@ module.exports = async (req, res) => {
     : "";
 
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="300" height="100" viewBox="0 0 300 100">
+  <style>${css}</style>
   ${panel}
   <clipPath id="c"><rect x="10" y="10" width="80" height="80" rx="6"/></clipPath>
   <g clip-path="url(#c)">${artEl}</g>
-  <text x="104" y="32" font-family="Arial, sans-serif" font-size="10" font-weight="700" letter-spacing="1" fill="${bar}">${status}</text>
-  <text x="104" y="54" font-family="Arial, sans-serif" font-size="15" font-weight="700" fill="${fg}">${esc(clip(title, 22))}</text>
-  <text x="104" y="74" font-family="Arial, sans-serif" font-size="12" fill="${fg}" fill-opacity="0.7">${esc(clip(artist, 24))}</text>
+  <text class="a" x="104" y="32" font-family="Arial, sans-serif" font-size="10" font-weight="700" letter-spacing="1">${status}</text>
+  <text class="t" x="104" y="54" font-family="Arial, sans-serif" font-size="15" font-weight="700">${esc(clip(title, 22))}</text>
+  <text class="s" x="104" y="74" font-family="Arial, sans-serif" font-size="12">${esc(clip(artist, 24))}</text>
   ${bars}
 </svg>`;
 
