@@ -7,6 +7,7 @@
 //                      art_bg=1 (blurred album art of the top track as the card background),
 //                      anim=0 (turn off the fade-in of the rows),
 //                      scrobbles=0 (hide the scrobble count shown in the header when idle),
+//                      marquee=0 (don't scroll long titles, cut them with "…" instead),
 //                      fresh=1 (skip all caching, always the live data)
 // Status: playing -> NOW LISTENING | otherwise -> NOT LISTENING + total scrobbles
 // Album art: Last.fm first; if it has none, iTunes and Deezer are tried at the same time.
@@ -62,6 +63,7 @@ const THEMES = {
 const IDLE_DOT = "#9aa9c0";
 const HEART_PATH = "M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z";
 const HEART_SIZE = 13;
+const HEART_X = W - PAD - 62 - HEART_SIZE; // fixed column for the heart: same x on every row, clear of the widest timestamp
 const NOTE_PATH = "M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"; // music note for tracks with no cover art
 
 const CACHE_FAST = "public, max-age=0, s-maxage=10, stale-while-revalidate=20";
@@ -126,6 +128,30 @@ const ago = (uts) => {
   if (months < 12) return months + "mo ago";
   return Math.floor(s / (86400 * 365.25)) + "y ago";
 };
+
+// Scrobblers (like a YouTube extension) can scrobble a track at ~70% while it is still "now playing", or send it twice.
+// Last.fm then lists the same song twice in a row, so those copies are merged into one row.
+const NOWPLAYING_DUP_S = 15 * 60; // the scrobbled copy of the song that is playing now is at most this old
+const DOUBLE_SCROBBLE_S = 90; // the same song scrobbled twice within this many seconds counts as one
+const sameSong = (a, b) =>
+  a.title.trim().toLowerCase() === b.title.trim().toLowerCase() && a.artist.trim().toLowerCase() === b.artist.trim().toLowerCase();
+function dedupeScrobbles(list) {
+  const out = [];
+  const nowS = Date.now() / 1000;
+  for (const t of list) {
+    const prev = out[out.length - 1];
+    if (prev && sameSong(prev, t)) {
+      const nowPlayingCopy = prev.playing && !t.playing && t.uts && nowS - t.uts <= NOWPLAYING_DUP_S;
+      const doubleScrobble = !prev.playing && !t.playing && prev.uts && t.uts && Math.abs(prev.uts - t.uts) <= DOUBLE_SCROBBLE_S;
+      if (nowPlayingCopy || doubleScrobble) {
+        prev.loved = prev.loved || t.loved; // keep the heart if either copy has it
+        continue;
+      }
+    }
+    out.push(t);
+  }
+  return out;
+}
 
 const get = (url, ms) => fetch(url, { signal: AbortSignal.timeout(ms) });
 
@@ -206,7 +232,7 @@ async function loadTracks(user, key, n) {
   ]);
 
   const api =
-    `https://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&limit=${n}&format=json&extended=1` +
+    `https://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&limit=${n + 3}&format=json&extended=1` +
     `&user=${encodeURIComponent(user)}&api_key=${encodeURIComponent(key)}`;
   const data = await (await get(api, LASTFM_TIMEOUT_MS)).json();
 
@@ -228,8 +254,7 @@ async function loadTracks(user, key, n) {
     };
   }
 
-  list = list.slice(0, n);
-  const tracks = list.map((t) => {
+  const mapped = list.map((t) => {
     const imgs = Array.isArray(t.image) ? t.image : [];
     const pick = imgs.find((i) => i.size === "medium") || imgs.find((i) => i.size === "large") || imgs[imgs.length - 1];
     return {
@@ -242,6 +267,7 @@ async function loadTracks(user, key, n) {
       art: null,
     };
   });
+  const tracks = dedupeScrobbles(mapped).slice(0, n);
 
   // All art lookups (and the profile) run in parallel under one overall time cap.
   const [, prof] = await Promise.all([
@@ -346,6 +372,7 @@ module.exports = async (req, res) => {
   const showLoved = q.loved !== "0";
   const loved = norm(hex(q.loved_color, th.loved));
   const animate = q.anim !== "0";
+  const scrollTitles = q.marquee !== "0";
   const showScrobbles = q.scrobbles !== "0";
 
   const asked = q.recent === undefined ? DEFAULT_RECENT : parseInt(q.recent, 10);
@@ -431,6 +458,7 @@ module.exports = async (req, res) => {
 
   out += `<line x1="${PAD}" y1="${HEADER_H}" x2="${W - PAD}" y2="${HEADER_H}" stroke="#ffffff" stroke-opacity="0.18"/>`;
 
+  let mqCss = ""; // keyframes for scrolling titles (one per row that needs it)
   let rows = "";
 
   if (!tracks.length) {
@@ -457,13 +485,33 @@ module.exports = async (req, res) => {
 
       const ts = tr.playing ? "" : ago(tr.uts);
       const rightEdge = tr.playing ? W - PAD - 26 : W - PAD - ts.length * 6.2;
-      const loveMark = showLoved && tr.loved ? heart(rightEdge - 8 - HEART_SIZE, y0 + 17, loved) : "";
+      const hasHeart = showLoved && tr.loved;
+      const loveMark = hasHeart ? heart(HEART_X, y0 + 17, loved) : "";
+
+      // Title: short ones are drawn exactly as before; long ones scroll sideways inside a window instead of ending in "…".
+      // The browser measures the text itself (-100% = the text's own width), so the distance is exact for any font.
+      const TX = PAD + THUMB + 14;
+      const tWeight = tr.playing ? 700 : 600;
+      const tUnits = Array.from(tr.title).reduce((a, c) => a + units(c), 0);
+      let titleEl;
+      if (scrollTitles && tUnits > 34) {
+        const visW = Math.max(60, (hasHeart ? HEART_X - 8 : rightEdge - 10) - TX); // room before the heart / timestamp
+        const dur = Math.max(5, (tUnits * 8 - visW) / 20); // only sets the speed
+        defs.push(`<clipPath id="m${i}"><rect x="${TX}" y="${y0 + 4}" width="${visW}" height="28"/></clipPath>`);
+        mqCss += `@keyframes mq${i}{0%,18%{transform:translateX(0)}82%,100%{transform:translateX(min(0px,calc(-100% + ${visW - 12}px)))}}`;
+        titleEl =
+          `<g clip-path="url(#m${i})">` +
+          label("t", TX, y0 + 23, 14.5, tWeight, esc(tr.title), ` style="transform-box:fill-box;animation:mq${i} ${dur.toFixed(1)}s ease-in-out infinite alternate"`) +
+          `</g>`;
+      } else {
+        titleEl = label("t", TX, y0 + 23, 14.5, tWeight, esc(clip(tr.title, 34)));
+      }
 
       const body =
         hilite +
         sep +
         thumbSvg(tr.art, i, ty) +
-        label("t", PAD + THUMB + 14, y0 + 23, 14.5, tr.playing ? 700 : 600, esc(clip(tr.title, 34))) +
+        titleEl +
         label("n", PAD + THUMB + 14, y0 + 40, 12, 400, esc(clip(tr.artist, 42))) +
         loveMark +
         (tr.playing ? bars(cy) : label("s", W - PAD, y0 + 27, 12, 400, esc(ts), ' text-anchor="end"'));
@@ -497,6 +545,7 @@ module.exports = async (req, res) => {
 
   const style =
     `.a{fill:${accent}}.t{fill:${text}}.s{fill:${text};fill-opacity:.8}.n{fill:${text};fill-opacity:.66}` +
+    mqCss +
     (animate
       ? `@keyframes in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}` +
         `.r{animation:in .55s cubic-bezier(.2,.7,.2,1) backwards}`
