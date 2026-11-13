@@ -8,6 +8,7 @@
 //                      anim=0 (turn off the fade-in of the rows),
 //                      scrobbles=0 (hide the scrobble count shown in the header when idle),
 //                      marquee=0 (don't scroll long titles, cut them with "…" instead),
+//                      stats=all|week|month|0 (stats strip under the tracks, default all time; 0 hides it),
 //                      fresh=1 (skip all caching, always the live data)
 // Status: playing -> NOW LISTENING | otherwise -> NOT LISTENING + total scrobbles
 // Album art: Last.fm first; if it has none, iTunes and Deezer are tried at the same time.
@@ -19,7 +20,7 @@ const LASTFM_TIMEOUT_MS = 4000;
 const ART_TIMEOUT_MS = 2000;
 const ART_TOTAL_MS = 2500; // hard cap on all art lookups together, so the card never stalls
 const MEMO_MS = 5000;
-const PROFILE_TTL_MS = 60 * 60 * 1000; // profile picture + scrobble count: keep for an hour
+const PROFILE_TTL_MS = 60 * 1000; // profile info (picture + all-time counts) is re-checked every minute
 const DEFAULT_RECENT = 5;
 const MAX_RECENT = 8;
 
@@ -63,6 +64,17 @@ const THEMES = {
 const IDLE_DOT = "#9aa9c0";
 const HEART_PATH = "M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z";
 const HEART_SIZE = 13;
+// Stats strip under the tracks
+const FOOT_H = 62; // height of the strip (includes the bottom padding)
+const STATS_TTL_MS = 60 * 1000; // week/month numbers are cached for a minute, so most card loads need no extra requests
+const STATS_WAIT_MS = 1500; // the card never waits longer than this for the numbers (it then uses the last known ones, or no strip)
+const STATS_MODES = {
+  week: { api: "7day", secs: 7 * 86400, label: "THIS WEEK" },
+  month: { api: "1month", secs: 30 * 86400, label: "THIS MONTH" },
+  all: { label: "ALL TIME" },
+};
+const MIC_PATH = "M12 14c1.66 0 2.99-1.34 2.99-3L15 5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z";
+const DISC_PATH = "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 14.5c-2.49 0-4.5-2.01-4.5-4.5S9.51 7.5 12 7.5s4.5 2.01 4.5 4.5-2.01 4.5-4.5 4.5zm0-5.5c-.55 0-1 .45-1 1s.45 1 1 1 1-.45 1-1-.45-1-1-1z";
 const HEART_X = W - PAD - 62 - HEART_SIZE; // fixed column for the heart: same x on every row, clear of the widest timestamp
 const NOTE_PATH = "M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"; // music note for tracks with no cover art
 
@@ -72,7 +84,8 @@ const CACHE_LIVE = "no-store, no-cache, max-age=0, must-revalidate";
 const lastGood = new Map(); // user -> last good result, shown if Last.fm hiccups
 
 const artCache = new Map(); // "artist|title" -> data URI
-const profileCache = new Map(); // user -> { ts, uri, scrobbles }
+const profileCache = new Map(); // user -> { ts, uri, imgUrl, scrobbles, artists, tracks }
+const statsCache = new Map(); // "user|mode" -> { ts, scrobbles, artists, tracks, label }
 const memo = new Map(); // "user|n" -> { ts, data }
 const inflight = new Map(); // "user|n" -> Promise
 
@@ -215,21 +228,67 @@ async function getProfile(user, key) {
   const url = pick ? pick["#text"] : "";
 
   let uri = null;
-  if (url && !url.includes(AVATAR_PLACEHOLDER_ID)) uri = await toDataUri(url);
-  const rec = { ts: Date.now(), uri, scrobbles: Number(u.playcount) || 0 };
+  if (url && !url.includes(AVATAR_PLACEHOLDER_ID)) uri = hit && hit.imgUrl === url && hit.uri ? hit.uri : await toDataUri(url); // same picture as last time: no new download
+  const count = (v) => (v === undefined || v === "" ? null : Number(v) || 0);
+  const rec = { ts: Date.now(), uri, imgUrl: url, scrobbles: Number(u.playcount) || 0, artists: count(u.artist_count), tracks: count(u.track_count) };
   capped(profileCache, user, rec, 20);
+  return rec;
+}
+
+// Numbers for the stats strip. Last.fm's own counters are used (limit=1 keeps every answer tiny):
+// scrobbles in the period, and how many different artists / tracks were played in it.
+const totalOf = (j, field) => {
+  const t = j && j[field] && j[field]["@attr"] ? j[field]["@attr"].total : undefined;
+  const v = t === undefined || t === null || t === "" ? NaN : Number(t);
+  return Number.isFinite(v) ? v : null; // null = "unknown" (shown as a dash), never a fake 0
+};
+async function getStats(user, key, mode) {
+  const ck = `${user}|${mode}`;
+  const hit = statsCache.get(ck);
+  if (hit && Date.now() - hit.ts < STATS_TTL_MS) return hit;
+
+  const m = STATS_MODES[mode];
+  const base =
+    `https://ws.audioscrobbler.com/2.0/?format=json&limit=1` +
+    `&user=${encodeURIComponent(user)}&api_key=${encodeURIComponent(key)}`;
+  const ask = (params) => get(`${base}&${params}`, ART_TIMEOUT_MS).then((r) => r.json()).catch(() => null);
+  const from = Math.floor(Date.now() / 1000 - m.secs);
+  const [recent, artists, tracks] = await Promise.all([
+    ask(`method=user.getrecenttracks&from=${from}`),
+    ask(`method=user.gettopartists&period=${m.api}`),
+    ask(`method=user.gettoptracks&period=${m.api}`),
+  ]);
+  const rec = {
+    ts: Date.now(),
+    scrobbles: totalOf(recent, "recenttracks"),
+    artists: totalOf(artists, "topartists"),
+    tracks: totalOf(tracks, "toptracks"),
+    label: m.label,
+  };
+  if (rec.scrobbles === null && rec.artists === null && rec.tracks === null) throw new Error("no stats");
+  capped(statsCache, ck, rec, 20);
   return rec;
 }
 
 const artistOf = (t) => (t.artist && (t.artist["#text"] || t.artist.name)) || "";
 
 // One trip to Last.fm. Returns { ok, message?, avatar, scrobbles, tracks: [{ title, artist, uts, playing, loved, art }] }.
-async function loadTracks(user, key, n) {
+async function loadTracks(user, key, n, statsMode) {
   // Start the profile lookup right away so it runs alongside everything else.
   const profileP = Promise.race([
     getProfile(user, key).catch(() => profileCache.get(user) || null),
     new Promise((done) => setTimeout(() => done(null), ART_TOTAL_MS)),
   ]);
+
+  // Stats strip numbers also start right away, in parallel; if they are slow or fail the card just has no strip.
+  const statsP = !statsMode
+    ? Promise.resolve(null)
+    : statsMode === "all"
+      ? profileP.then((pr) => (pr ? { scrobbles: pr.scrobbles, artists: pr.artists, tracks: pr.tracks, label: STATS_MODES.all.label } : null))
+      : Promise.race([
+          getStats(user, key, statsMode).catch(() => statsCache.get(`${user}|${statsMode}`) || null),
+          new Promise((done) => setTimeout(() => done(statsCache.get(`${user}|${statsMode}`) || null), STATS_WAIT_MS)),
+        ]);
 
   const api =
     `https://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&limit=${n + 3}&format=json&extended=1` +
@@ -270,7 +329,7 @@ async function loadTracks(user, key, n) {
   const tracks = dedupeScrobbles(mapped).slice(0, n);
 
   // All art lookups (and the profile) run in parallel under one overall time cap.
-  const [, prof] = await Promise.all([
+  const [, prof, stats] = await Promise.all([
     Promise.all(
       tracks.map((tr) =>
         Promise.race([
@@ -280,18 +339,19 @@ async function loadTracks(user, key, n) {
       )
     ),
     profileP,
+    statsP,
   ]);
   tracks.forEach((tr) => delete tr.artUrl);
-  return { ok: true, tracks, avatar: prof ? prof.uri : null, scrobbles: prof ? prof.scrobbles : 0 };
+  return { ok: true, tracks, avatar: prof ? prof.uri : null, scrobbles: prof ? prof.scrobbles : 0, stats };
 }
 
-function getTracks(user, key, n, fresh) {
-  const k = `${user}|${n}`;
+function getTracks(user, key, n, fresh, statsMode) {
+  const k = `${user}|${n}|${statsMode || 0}`;
   const m = memo.get(k);
   if (!fresh && m && Date.now() - m.ts < MEMO_MS) return Promise.resolve(m.data);
   if (inflight.has(k)) return inflight.get(k);
 
-  const p = loadTracks(user, key, n)
+  const p = loadTracks(user, key, n, statsMode)
     .then((data) => {
       capped(memo, k, { ts: Date.now(), data }, 20);
       return data;
@@ -373,6 +433,8 @@ module.exports = async (req, res) => {
   const loved = norm(hex(q.loved_color, th.loved));
   const animate = q.anim !== "0";
   const scrollTitles = q.marquee !== "0";
+  const statsArg = String(Array.isArray(q.stats) ? q.stats[0] : q.stats || "").toLowerCase();
+  const statsMode = statsArg === "0" ? null : statsArg === "week" || statsArg === "month" ? statsArg : "all";
   const showScrobbles = q.scrobbles !== "0";
 
   const asked = q.recent === undefined ? DEFAULT_RECENT : parseInt(q.recent, 10);
@@ -388,7 +450,7 @@ module.exports = async (req, res) => {
       tracks: [],
     };
   } else try {
-    data = await getTracks(user, key, n, q.fresh === "1");
+    data = await getTracks(user, key, n, q.fresh === "1", statsMode);
     if (data.ok && data.tracks.length) capped(lastGood, user, data, 20);
   } catch (e) {
     fellBack = true;
@@ -522,7 +584,38 @@ module.exports = async (req, res) => {
   }
 
   const count = Math.max(1, tracks.length);
-  const height = HEADER_H + count * ROW_H + BOTTOM_PAD;
+  const stats = tracks.length && data.stats ? data.stats : null;
+  const yF = HEADER_H + count * ROW_H; // top of the stats strip
+  const height = yF + (stats ? FOOT_H : BOTTOM_PAD);
+
+  // Stats strip: a labelled divider ("THIS WEEK") and three icon + number columns.
+  let footer = "";
+  if (stats) {
+    const colW = (W - 2 * PAD) / 3;
+    const lineY = yF + 6;
+    const lblW = stats.label.length * 8; // rough width of the label incl. letter spacing
+    const num = (v) => (v === null || v === undefined || Number.isNaN(v) ? "–" : Number(v).toLocaleString("en-US"));
+    let f =
+      `<line x1="${PAD}" y1="${lineY}" x2="${(W / 2 - lblW / 2 - 8).toFixed(1)}" y2="${lineY}" stroke="#ffffff" stroke-opacity="0.18"/>` +
+      `<line x1="${(W / 2 + lblW / 2 + 8).toFixed(1)}" y1="${lineY}" x2="${W - PAD}" y2="${lineY}" stroke="#ffffff" stroke-opacity="0.18"/>` +
+      label("s", W / 2, lineY + 3.5, 9.5, 700, stats.label, ' text-anchor="middle" letter-spacing="1.6"');
+    [
+      ["scrobbles", "SCROBBLES", NOTE_PATH],
+      ["artists", "ARTISTS", MIC_PATH],
+      ["tracks", "TRACKS", DISC_PATH],
+    ].forEach(([k, name, icon], j) => {
+      const cx = PAD + colW * (j + 0.5);
+      const val = num(stats[k]);
+      const numW = Array.from(val).reduce((a, c) => a + (c === "," ? 5 : 10.2), 0); // digits are about the same width
+      const gx = cx - (20 + numW) / 2; // icon (14) + gap (6) + number, centred in its column
+      f +=
+        `<path class="a" d="${icon}" transform="translate(${gx.toFixed(1)} ${yF + 21}) scale(0.5833)"/>` +
+        label("t", (gx + 20).toFixed(1), yF + 33, 17, 700, esc(val)) +
+        label("n", cx.toFixed(1), yF + 47, 9.5, 600, name, ' text-anchor="middle" letter-spacing="1.3"');
+      if (j > 0) f += `<line x1="${(PAD + colW * j).toFixed(1)}" y1="${yF + 22}" x2="${(PAD + colW * j).toFixed(1)}" y2="${yF + 48}" stroke="#ffffff" stroke-opacity="0.12"/>`;
+    });
+    footer = animate ? `<g class="r" style="animation-delay:${120 + count * 90}ms">${f}</g>` : f;
+  }
 
   // Card-wide depth: gradient, corner glow, bottom shade, optional blurred album-art background.
   const artBg = q.art_bg === "1" && first && first.art;
@@ -562,6 +655,7 @@ module.exports = async (req, res) => {
     `<rect x="0.5" y="0.5" width="${W - 1}" height="${height - 1}" rx="13.5" fill="none" stroke="#ffffff" stroke-opacity="0.18"/>` +
     out +
     rows +
+    footer +
     `</svg>`;
 
   res.setHeader("Content-Type", "image/svg+xml; charset=utf-8");
