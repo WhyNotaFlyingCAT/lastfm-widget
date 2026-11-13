@@ -80,8 +80,38 @@ const capped = (map, k, v, max) => {
 };
 
 const ESC = { "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&#39;" };
-const esc = (s) => String(s).replace(/[<>&"']/g, (c) => ESC[c]);
-const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
+// Characters XML can't contain (control codes, lone surrogates) would make the whole SVG fail to render, so drop them.
+const BAD_XML = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+const esc = (s) => String(s).replace(BAD_XML, "").replace(/[<>&"']/g, (c) => ESC[c]);
+
+// Rough text width in "units" (a typical lowercase letter = 1). Japanese/Chinese/Korean/emoji are about twice as wide,
+// capitals and m/w are wider, thin letters like i and l are narrower. Used so long text is cut by width, not by character count.
+const isWide = (cp) =>
+  (cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) ||
+  (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe30 && cp <= 0xfe6f) || (cp >= 0xff00 && cp <= 0xff60) ||
+  (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f300 && cp <= 0x1faff) || (cp >= 0x20000 && cp <= 0x3fffd);
+const units = (ch) => {
+  if (isWide(ch.codePointAt(0))) return 2;
+  if (/[MWmw@]/.test(ch)) return 1.5;
+  if (/[A-Z]/.test(ch)) return 1.25;
+  if (/[ilj't.,:;!|()\[\]]/.test(ch)) return 0.55;
+  return 1;
+};
+// Cut text to at most maxUnits wide, adding "…" when something was removed. Splits by whole characters (never half an emoji).
+const clip = (s, maxUnits) => {
+  const chars = Array.from(String(s));
+  let used = 0;
+  for (let i = 0; i < chars.length; i++) {
+    used += units(chars[i]);
+    if (used > maxUnits) {
+      let keep = chars.slice(0, i);
+      let u = keep.reduce((a, c) => a + units(c), 0);
+      while (keep.length && u + 1 > maxUnits) u -= units(keep.pop());
+      return keep.join("").trimEnd() + "…";
+    }
+  }
+  return chars.join("");
+};
 const hex = (v, fallback) => (/^([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(v || "") ? "#" + v : fallback);
 const norm = (h) => (!h ? null : h.length === 4 ? "#" + [...h.slice(1)].map((c) => c + c).join("") : h.slice(0, 7));
 
@@ -92,7 +122,9 @@ const ago = (uts) => {
   if (s < 3600) return Math.floor(s / 60) + "m ago";
   if (s < 86400) return Math.floor(s / 3600) + "h ago";
   if (s < 86400 * 30) return Math.floor(s / 86400) + "d ago";
-  return Math.floor(s / (86400 * 30)) + "mo ago";
+  const months = Math.floor(s / (86400 * 30.44));
+  if (months < 12) return months + "mo ago";
+  return Math.floor(s / (86400 * 365.25)) + "y ago";
 };
 
 const get = (url, ms) => fetch(url, { signal: AbortSignal.timeout(ms) });
@@ -302,10 +334,11 @@ const bars = (cy) =>
 
 module.exports = async (req, res) => {
   const q = req.query;
-  const user = q.username || process.env.LASTFM_USERNAME;
+  const user = String((Array.isArray(q.username) ? q.username[0] : q.username) || process.env.LASTFM_USERNAME || "").trim();
   const key = process.env.LASTFM_API_KEY;
 
-  const th = THEMES[String(q.theme || "").toLowerCase()] || THEMES.ocean;
+  const themeKey = String(Array.isArray(q.theme) ? q.theme[0] : q.theme || "").toLowerCase();
+  const th = Object.prototype.hasOwnProperty.call(THEMES, themeKey) ? THEMES[themeKey] : THEMES.ocean;
   const bg = hex(q.background_color, null);
   const bgFill = bg || "url(#g)";
   const accent = norm(hex(q.accent_color || q.bar_color, th.accent));
@@ -320,7 +353,14 @@ module.exports = async (req, res) => {
 
   let data;
   let fellBack = false;
-  try {
+  if (!user || !key) {
+    data = {
+      ok: false,
+      message: !user ? "Username missing" : "API key missing",
+      detail: !user ? "Set LASTFM_USERNAME or add ?username=" : "Set LASTFM_API_KEY in Vercel",
+      tracks: [],
+    };
+  } else try {
     data = await getTracks(user, key, n, q.fresh === "1");
     if (data.ok && data.tracks.length) capped(lastGood, user, data, 20);
   } catch (e) {
@@ -423,7 +463,7 @@ module.exports = async (req, res) => {
         hilite +
         sep +
         thumbSvg(tr.art, i, ty) +
-        label("t", PAD + THUMB + 14, y0 + 23, 14.5, tr.playing ? 700 : 600, esc(clip(tr.title, 36))) +
+        label("t", PAD + THUMB + 14, y0 + 23, 14.5, tr.playing ? 700 : 600, esc(clip(tr.title, 34))) +
         label("n", PAD + THUMB + 14, y0 + 40, 12, 400, esc(clip(tr.artist, 42))) +
         loveMark +
         (tr.playing ? bars(cy) : label("s", W - PAD, y0 + 27, 12, 400, esc(ts), ' text-anchor="end"'));
@@ -475,7 +515,7 @@ module.exports = async (req, res) => {
     rows +
     `</svg>`;
 
-  res.setHeader("Content-Type", "image/svg+xml");
+  res.setHeader("Content-Type", "image/svg+xml; charset=utf-8");
   res.setHeader("Cache-Control", q.fresh === "1" || fellBack || !data.ok ? CACHE_LIVE : CACHE_FAST);
   res.status(200).send(svg);
 };
